@@ -308,6 +308,12 @@ class DriverSession(
                 val tx = if (p.remaining() >= 4) p.int else -1
                 hl2?.setOpenCollectorOutputs(rx, tx)
             }
+            DriverProto.CMD_HL2_SET_AMP_KEY -> {
+                val mask = p.int
+                val txDelay = p.int
+                val hang = p.int
+                hl2?.setAmpKey(mask, txDelay, hang)
+            }
 
             // G2
             DriverProto.CMD_G2_SET_ATTENUATOR -> g2?.setStepAttenuator(p.int)
