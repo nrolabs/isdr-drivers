@@ -130,6 +130,7 @@ class DriverSession(
     }
 
     private fun onData(fft: FloatArray, iq: FloatArray) = send { frames.writeData(fft, iq) }
+    private fun onDataRx(rx: Int, iq: FloatArray) = send { frames.writeDataRx(rx, iq) }
 
     private fun onStatus(connected: Boolean, status: String) {
         DriverServiceState.update {
@@ -197,7 +198,7 @@ class DriverSession(
         when (frame.op) {
             DriverProto.CMD_HELLO -> {
                 val version = p.int
-                send { frames.writeI32(DriverProto.EV_HELLO, DriverProto.VERSION) }
+                send { frames.writeHello(DriverProto.VERSION, DriverProto.FEAT_RX_STREAMS) }
                 if (version != DriverProto.VERSION) {
                     Log.w(TAG, "protocol mismatch: app=$version host=${DriverProto.VERSION}")
                 }
@@ -282,6 +283,7 @@ class DriverSession(
                 hl2?.setFrequency2(hz)
                 g2?.setFrequency2(hz)
             }
+            DriverProto.CMD_SET_RX_STREAM_MASK -> hl2?.setRxStreamMask(p.int)
 
             // HL2
             DriverProto.CMD_HL2_SET_LNA -> hl2?.setLnaGain(p.int)
@@ -372,6 +374,7 @@ class DriverSession(
                         host = host.ifEmpty { Hl2Client.BROADCAST },
                         onDataReceived = ::onData,
                         onConnectionStatusChanged = ::onStatus,
+                        onDataRx = ::onDataRx,
                         onTelemetry = ::onHl2Telemetry,
                         port = if (port > 0) port else Hl2Protocol.PORT,
                         classicBoard = flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0,
