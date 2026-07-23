@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network radios (HL2 / ANAN-G2 / rtl_tcp) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- connectedDevice FGS eligibility on Android 14+ -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Keep the driver process off the OEM background-throttle cpuset
+         (/abnormal on Samsung): sustained real-time IQ delivery must run on
+         the performance cores, or the audio stutters ("robotic"). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- USB host: RTL-SDR dongles and HackRF boards -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.IsdrDrivers">
+
+        <activity
+            android:name=".DriverActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Exported on purpose and without a permission gate: the iSDR app
+             starts this service, then talks to it over the loopback socket
+             (DriverProto.PORT). A signature permission would break the
+             two-publisher model (different signing keys); the service itself
+             only moves radio IO and holds no user data. -->
+        <service
+            android:name=".DriverService"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice"
+            tools:ignore="ExportedService" />
+    </application>
+
+</manifest>

@@ -1,0 +1,70 @@
+name: Build & Release
+
+# Triggered by pushing a version tag (e.g. v1.0, v1.1) or manually.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0   # full history for the commit-count versionCode
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Restore keystore and signing credentials
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > isdr.jks
+          cat > keystore.properties <<EOF
+          storeFile=isdr.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Build signed AAB + APK
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          ./gradlew bundleRelease assembleRelease --no-daemon -PversionName="${V:-1.0}"
+
+      - name: Rename artifacts with the version
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp app/build/outputs/bundle/release/app-release.aab "dist/isdr-drivers-${V}.aab"
+          cp app/build/outputs/apk/release/app-release.apk "dist/isdr-drivers-${V}.apk" 2>/dev/null \
+            || cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/isdr-drivers-${V}.apk"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.apk
+            dist/*.aab
+          generate_release_notes: true
+
+      - name: Upload artifacts (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: isdr-drivers-release
+          path: dist/*
