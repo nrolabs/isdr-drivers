@@ -101,7 +101,10 @@ class DriverSession(
     private fun readLoop() {
         try {
             while (!closed) {
-                val frame = frames.read() ?: break
+                // Before auth, cap the payload hard (a token frame is tiny) so
+                // an unauthenticated peer can't force a 64 MB allocation
+                // (audit H3). After auth the full limit applies.
+                val frame = frames.read(if (authenticated) Int.MAX_VALUE else 4096) ?: break
                 handle(frame)
             }
         } catch (e: Exception) {
@@ -210,7 +213,12 @@ class DriverSession(
             DriverProto.CMD_AUTH -> {
                 val token = p.getUtf()
                 val ok = requiredToken != null && tokensMatch(token, requiredToken)
-                if (ok) authenticated = true
+                if (ok) {
+                    authenticated = true
+                    // Authenticated: drop the idle-auth timeout so the long-
+                    // lived IQ stream isn't interrupted (audit H2).
+                    try { socket.soTimeout = 0 } catch (_: Exception) {}
+                }
                 send { frames.writeBool(DriverProto.EV_AUTH_RESULT, ok) }
                 if (!ok) {
                     Log.w(TAG, "auth rejected — closing")

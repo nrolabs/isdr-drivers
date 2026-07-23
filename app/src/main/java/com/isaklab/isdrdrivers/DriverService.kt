@@ -45,6 +45,8 @@ class DriverService : Service() {
         private const val NOTIFICATION_ID = 1
         const val EXTRA_LAN = "lan"
         const val EXTRA_TOKEN = "token"
+        private const val MAX_SESSIONS = 4
+        private const val AUTH_TIMEOUT_MS = 5000
     }
 
     private var server: ServerSocket? = null
@@ -90,6 +92,10 @@ class DriverService : Service() {
         } catch (_: Exception) {
         }
         server = null
+        // Revoke live sessions: closing only the ServerSocket left already-
+        // authenticated sockets running under the OLD token (an ejected
+        // remote client kept keying the radio). Tear them down (audit H1).
+        synchronized(sessions) { sessions.toList() }.forEach { it.close() }
     }
 
     private fun startInForeground() {
@@ -148,8 +154,20 @@ class DriverService : Service() {
             try {
                 while (!stopping) {
                     val socket = srv.accept()
+                    // Cap concurrent sessions: any local app can dial the
+                    // loopback port; without a cap it opens N idle sockets and
+                    // pins N threads forever (audit H2).
+                    if (sessions.size >= MAX_SESSIONS) {
+                        Log.w(TAG, "session cap reached — dropping connection")
+                        try { socket.close() } catch (_: Exception) {}
+                        continue
+                    }
                     socket.tcpNoDelay = true
                     socket.sendBufferSize = 8 * 1024 * 1024
+                    // Idle-connection timeout: a peer that never sends CMD_AUTH
+                    // must not block a session thread indefinitely. DriverSession
+                    // clears it once authenticated.
+                    socket.soTimeout = AUTH_TIMEOUT_MS
                     Log.i(TAG, "session accepted")
                     val session = DriverSession(applicationContext, socket, token) { done ->
                         sessions.remove(done)
