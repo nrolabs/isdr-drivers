@@ -313,6 +313,14 @@ class DriverSession(
                 val tx = if (p.remaining() >= 4) p.int else -1
                 hl2?.setOpenCollectorOutputs(rx, tx)
             }
+            DriverProto.CMD_HL2_SET_VNA_COUNT -> hl2?.setVnaCount(p.int)
+            DriverProto.CMD_HL2_SET_PURESIGNAL -> hl2?.setPureSignal(p.getBool())
+            DriverProto.CMD_HL2_SET_CW_KEYER -> {
+                val en = p.getBool(); val wpm = p.int; val mode = p.int
+                val weight = p.int; val spacing = p.getBool(); val rev = p.getBool()
+                val delay = p.int; val hang = p.int
+                hl2?.setCwKeyer(en, wpm, mode, weight, spacing, rev, delay, hang)
+            }
             DriverProto.CMD_HL2_SET_AMP_KEY -> {
                 val mask = p.int
                 val txDelay = p.int

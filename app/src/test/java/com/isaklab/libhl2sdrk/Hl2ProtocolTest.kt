@@ -353,4 +353,56 @@ class Hl2ProtocolTest {
     private fun be32(b: ByteArray): Long =
         ((b[0].toLong() and 0xFF) shl 24) or ((b[1].toLong() and 0xFF) shl 16) or
                 ((b[2].toLong() and 0xFF) shl 8) or (b[3].toLong() and 0xFF)
+
+    @Test
+    fun controlFrame_encodesVnaCountAndPureSignal() {
+        val st = Hl2Protocol.ControlState().apply {
+            vnaMode = true; vnaCount = 0x1234; pureSignal = true
+        }
+        val f9 = Hl2Protocol.buildControlFrame(0, 8, st, null)
+        // addr 0x09 second sub-frame: C3/C4 = vna_count data[15:0].
+        assertEquals(0x12, f9[526].toInt() and 0xFF)
+        assertEquals(0x34, f9[527].toInt() and 0xFF)
+        // addr 0x0A first sub-frame: data[22] = C2 bit6 (pure_signal).
+        val fA = Hl2Protocol.buildControlFrame(0, 10, st, null)
+        assertTrue("pure_signal bit22", fA[13].toInt() and 0x40 != 0)
+    }
+
+    @Test
+    fun controlFrame_encodesGatewareCwKeyer() {
+        val st = Hl2Protocol.ControlState().apply {
+            cwKeyerEnabled = true
+            cwSpeedWpm = 25; cwMode = 2; cwWeight = 55
+            cwSpacing = true; cwReverse = true
+            cwPttDelayMs = 30; cwHangMs = 300
+        }
+        // addr 0x0B (second sub-frame of bank 10), cw_openhpsdr.v decode:
+        // weight=data[6:0], spacing=data[7], speed=data[13:8],
+        // mode=data[15:14], reverse=data[22].
+        val fB = Hl2Protocol.buildControlFrame(0, 10, st, null)
+        assertEquals(55, fB[527].toInt() and 0x7F)                 // weight
+        assertTrue("spacing", fB[527].toInt() and 0x80 != 0)
+        assertEquals(25, fB[526].toInt() and 0x3F)                 // speed wpm
+        assertEquals(2, (fB[526].toInt() shr 6) and 0x03)          // iambic-B
+        assertTrue("reverse bit22", fB[525].toInt() and 0x40 != 0)
+        // addr 0x0F (second sub-frame of bank 0x0E): ptt delay = data[15:8].
+        val fF = Hl2Protocol.buildControlFrame(0, 0x0E, st, null)
+        assertEquals(30, fF[526].toInt() and 0xFF)
+        // addr 0x10 (first sub-frame): hang = {data[31:24], data[17:16]}.
+        val f10 = Hl2Protocol.buildControlFrame(0, 0x10, st, null)
+        val hang = ((f10[12].toInt() and 0xFF) shl 2) or (f10[13].toInt() and 0x03)
+        assertEquals(300, hang)
+    }
+
+    @Test
+    fun controlFrame_encodesPwmEnvelope() {
+        val st = Hl2Protocol.ControlState().apply { pwmMin = 5; pwmMax = 1023 }
+        // addr 0x11 (second sub-frame of bank 0x10):
+        // min = {data[31:24], data[17:16]}, max = {data[15:8], data[1:0]}.
+        val f = Hl2Protocol.buildControlFrame(0, 0x10, st, null)
+        val mn = ((f[524].toInt() and 0xFF) shl 2) or (f[525].toInt() and 0x03)
+        val mx = ((f[526].toInt() and 0xFF) shl 2) or (f[527].toInt() and 0x03)
+        assertEquals(5, mn)
+        assertEquals(1023, mx)
+    }
 }
