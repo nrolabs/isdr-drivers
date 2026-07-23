@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher foreground: ONE bold spectrum trace with a central peak — a
+     single strong silhouette that stays readable at 48 dp. Everything lives
+     inside the adaptive-icon safe zone (central ~66 dp of the 108 canvas).
+     Green trace over the nrolabs® purple background. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Gradient fill under the trace -->
+    <path android:pathData="M28,70 L37,65 L44,67 L50,46 L54,32 L58,46 L64,62 L71,60 L80,68 L80,74 L28,74 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54" android:startY="32"
+                android:endX="54" android:endY="74"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#B300E676" />
+                <item android:offset="1.0" android:color="#0000E676" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- The trace itself: thick, round-joined -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M28,70 L37,65 L44,67 L50,46 L54,32 L58,46 L64,62 L71,60 L80,68"
+        android:strokeWidth="5"
+        android:strokeColor="#00E676"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- Peak dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,32 m-3.2,0 a3.2,3.2 0 1,1 6.4,0 a3.2,3.2 0 1,1 -6.4,0" />
+</vector>
