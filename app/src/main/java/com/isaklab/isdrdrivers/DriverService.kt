@@ -68,7 +68,10 @@ class DriverService : Service() {
         // network. The token gates every LAN session (see DriverSession).
         val wantLan = intent?.getBooleanExtra(EXTRA_LAN, false) == true
         val token = intent?.getStringExtra(EXTRA_TOKEN)
-        if (wantLan != lanEnabled || (wantLan && token != accessToken)) {
+        // The token gates EVERY session, loopback included: any other local
+        // app can reach 127.0.0.1:PORT and would otherwise open the radio and
+        // key TX. Re-arm the server whenever the mode or the secret changes.
+        if (wantLan != lanEnabled || token != accessToken) {
             lanEnabled = wantLan
             accessToken = token
             restartServer()
@@ -132,7 +135,7 @@ class DriverService : Service() {
         // remote client (over WireGuard, or directly on a trusted LAN) can
         // reach the driver. LAN sessions must present the shared token.
         val bindAddr = if (lanEnabled) null else InetAddress.getLoopbackAddress()
-        val token = accessToken.takeIf { lanEnabled }
+        val token = accessToken   // required for every session now
         val srv = try {
             ServerSocket(DriverProto.PORT, 4, bindAddr)
         } catch (e: Exception) {

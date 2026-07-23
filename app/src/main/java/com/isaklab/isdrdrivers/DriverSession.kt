@@ -54,9 +54,10 @@ class DriverSession(
     private val context: Context,
     private val socket: Socket,
     /**
-     * Shared secret a LAN client must present in CMD_AUTH before any device
-     * command is honoured. Null for loopback sessions — nothing but this
-     * device can reach 127.0.0.1, so they are trusted without a token.
+     * Per-connection secret the client must present in CMD_AUTH before any
+     * device command is honoured. Required for every session (loopback too):
+     * other local apps can reach 127.0.0.1:PORT and must not be able to open
+     * the radio or key the transmitter.
      */
     private val requiredToken: String?,
     private val onClosed: (DriverSession) -> Unit,
@@ -74,8 +75,11 @@ class DriverSession(
         }
     }
 
-    // Loopback = already trusted; LAN = must authenticate first.
-    @Volatile private var authenticated = requiredToken == null
+    // Every session must authenticate with the per-connection token before
+    // any device command is honoured — loopback is NOT trusted (another local
+    // app could open the radio and key TX otherwise). A missing token means
+    // misconfiguration, so it fails closed (never authenticated).
+    @Volatile private var authenticated = false
 
     private val frames = Frames(
         DataInputStream(BufferedInputStream(socket.getInputStream(), 64 * 1024)),
