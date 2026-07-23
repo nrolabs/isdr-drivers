@@ -133,15 +133,17 @@ class Hl2ProtocolTest {
     @Test
     fun controlFrame_encodesBanksThatDecodeBack() {
         val st = Hl2Protocol.ControlState().apply {
-            rxFreqHz = 14_074_000L
+            rxFreqHz[0] = 14_074_000L
             txFreqHz = 7_074_000L
             sampleRate = 192000
             lnaGainDb = 30
             txDrive = 200
             paEnabled = true
             mox = true
-            receiverCount = 2
-            rx2FreqHz = 10_136_000L
+            receiverCount = 4
+            rxFreqHz[1] = 10_136_000L
+            rxFreqHz[2] = 18_100_000L
+            rxFreqHz[3] = 21_074_000L
         }
         // Walk all bank pairs (0,2,4,6,8,10) as the driver rotates them.
         val decoded = HashMap<Int, ByteArray>()
@@ -161,8 +163,10 @@ class Hl2ProtocolTest {
         assertEquals(14_074_000L, be32(decoded[2]!!))
         assertEquals(2, decoded[0]!![0].toInt() and 0x03)     // speed for 192k
         assertEquals(0x04, decoded[0]!![3].toInt() and 0x04)  // duplex on
-        assertEquals(1, (decoded[0]!![3].toInt() shr 3) and 0x07)  // 2 receivers (n-1)
         assertEquals(10_136_000L, be32(decoded[3]!!))         // addr3 = RX2 freq
+        assertEquals(18_100_000L, be32(decoded[4]!!))         // addr4 = RX3 freq
+        assertEquals(21_074_000L, be32(decoded[5]!!))         // addr5 = RX4 freq
+        assertEquals(3, (decoded[0]!![3].toInt() shr 3) and 0x07)  // 4 receivers (n-1)
         assertEquals(200, decoded[9]!![0].toInt() and 0xFF)   // drive
         assertTrue(decoded[9]!![1].toInt() and 0x08 != 0)     // PA enabled
         val lna = decoded[10]!![3].toInt() and 0xFF

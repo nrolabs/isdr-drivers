@@ -295,6 +295,11 @@ class DriverSession(
                 hl2?.setFrequency2(hz)
                 g2?.setFrequency2(hz)
             }
+            DriverProto.CMD_SET_RX_FREQUENCY -> {
+                val idx = p.int
+                val hz = p.long
+                hl2?.setRxFrequency(idx, hz)
+            }
             DriverProto.CMD_SET_RX_STREAM_MASK -> hl2?.setRxStreamMask(p.int)
 
             // HL2
