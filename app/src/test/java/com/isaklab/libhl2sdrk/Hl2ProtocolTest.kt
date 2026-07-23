@@ -405,4 +405,23 @@ class Hl2ProtocolTest {
         assertEquals(5, mn)
         assertEquals(1023, mx)
     }
+
+    @Test
+    fun controlFrame_oneShotRegisterOverridesFirstSubframe() {
+        val st = Hl2Protocol.ControlState().apply {
+            oneShotAddr = 0x3D
+            // i2c_bus2.v write: [31:25]=0x03, dev=0x20, reg=0x0A, val=0x55.
+            oneShotData = (0x03 shl 25) or (0x20 shl 16) or (0x0A shl 8) or 0x55
+        }
+        val f = Hl2Protocol.buildControlFrame(0, 2, st, null)
+        assertEquals(0x3D, (f[11].toInt() and 0xFF) shr 1)
+        assertEquals(0x03, (f[12].toInt() and 0xFF) shr 1)         // data[31:25]
+        assertEquals(0x20, f[13].toInt() and 0x7F)                 // device
+        assertEquals(0x0A, f[14].toInt() and 0xFF)                 // reg
+        assertEquals(0x55, f[15].toInt() and 0xFF)                 // value
+        // Consumed: the next frame returns to the normal rotation.
+        assertEquals(-1, st.oneShotAddr)
+        val f2 = Hl2Protocol.buildControlFrame(1, 2, st, null)
+        assertEquals(2, (f2[11].toInt() and 0xFF) shr 1)
+    }
 }
