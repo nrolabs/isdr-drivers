@@ -71,6 +71,8 @@ class DriverSession(
         /** Encoded-frame buffers kept for reuse (see [bufPool]). */
         private const val MAX_POOLED = 80
 
+        private val EMPTY_FLOATS = FloatArray(0)
+
         /** Constant-time equality — never leak the token by comparison timing. */
         private fun tokensMatch(a: String, b: String): Boolean {
             val ab = a.toByteArray(Charsets.UTF_8)
@@ -93,6 +95,90 @@ class DriverSession(
     )
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var closed = false
+
+    // ---- shared-memory IQ ring (FEAT_SHM_RING, loopback fast path) --------
+    //
+    // Created on demand by the app's SHM_TRANSACT_GET_RING binder call (see
+    // DriverService.onBind) and armed only after the app confirms with
+    // CMD_SHM_ATTACH. While armed, EV_DATA / EV_DATA_RX payloads go through
+    // the ring (one memcpy, driver buffer -> slot) and the TCP session
+    // carries only an 8-byte EV_SHM_FRAME notification, keeping ordering
+    // with the status/telemetry frames around it. Publication happens BEFORE
+    // the notification is enqueued and the ring never overwrites an unread
+    // slot, so the app can never observe a torn block (see ShmRing docs).
+    private var sharedMemory: android.os.SharedMemory? = null
+    private var shmBuffer: java.nio.ByteBuffer? = null
+    @Volatile private var shmRing: com.isaklab.isdrproto.ShmRing? = null
+    @Volatile private var shmArmed = false
+
+    /** True for the authenticated session owning [token] (constant-time). */
+    fun ownsToken(token: String): Boolean =
+        authenticated && requiredToken != null && tokensMatch(token, requiredToken)
+
+    /**
+     * Create (once) and return the ring geometry + shared memory for the
+     * binder handshake; null when unavailable (API < 27, closed, or ashmem
+     * failure) — the app then simply stays on the TCP data plane.
+     */
+    @Synchronized
+    fun acquireShm(): Triple<android.os.SharedMemory, Int, Int>? {
+        if (closed || android.os.Build.VERSION.SDK_INT < 27) return null
+        sharedMemory?.let {
+            return Triple(it, com.isaklab.isdrproto.ShmRing.DEFAULT_SLOTS,
+                com.isaklab.isdrproto.ShmRing.DEFAULT_SLOT_BYTES)
+        }
+        return try {
+            val nSlots = com.isaklab.isdrproto.ShmRing.DEFAULT_SLOTS
+            val slotBytes = com.isaklab.isdrproto.ShmRing.DEFAULT_SLOT_BYTES
+            val shm = android.os.SharedMemory.create(
+                "isdr-iq-ring", com.isaklab.isdrproto.ShmRing.totalBytes(nSlots, slotBytes))
+            val buf = shm.mapReadWrite()
+            shmBuffer = buf
+            shmRing = com.isaklab.isdrproto.ShmRing.create(buf, nSlots, slotBytes)
+            sharedMemory = shm
+            Log.i(TAG, "shm ring created: $nSlots x $slotBytes bytes")
+            Triple(shm, nSlots, slotBytes)
+        } catch (e: Exception) {
+            Log.w(TAG, "shm ring unavailable: ${e.message}")
+            null
+        }
+    }
+
+    private fun releaseShm() {
+        shmArmed = false
+        shmRing = null
+        val buf = shmBuffer
+        shmBuffer = null
+        val shm = sharedMemory
+        sharedMemory = null
+        try {
+            if (buf != null && android.os.Build.VERSION.SDK_INT >= 27) {
+                android.os.SharedMemory.unmap(buf)
+            }
+            shm?.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Publish a data block to the ring; true when handled (published, or
+     * dropped-and-counted on consumer lag). False = not armed or block too
+     * big for a slot — caller falls back to the TCP frame path.
+     */
+    private fun publishShm(type: Int, a: Int, fft: FloatArray, iq: FloatArray): Boolean {
+        if (!shmArmed) return false
+        val ring = shmRing ?: return false
+        val seq = ring.tryPublish(type, a, fft, fft.size, iq, iq.size)
+        if (seq == -2L) return false               // oversized: TCP fallback
+        if (seq < 0) {                             // ring full: drop-newest, counted
+            synchronized(outLock) { outDrops++ }
+            return true
+        }
+        val b = obtainBuf(8)
+        java.nio.ByteBuffer.wrap(b).putLong(seq)
+        enqueue(OutEntry(DriverProto.EV_SHM_FRAME, b, 8, null, droppable = true))
+        return true
+    }
 
     private var rtlTcp: RTLTCPClient? = null
     private var rtlUsb: RTLUSBClient? = null
@@ -211,6 +297,7 @@ class DriverSession(
         if (closed) return
         closed = true
         closeDevice()
+        releaseShm()
         synchronized(outLock) { outLock.notifyAll() }   // release the writer
         scope.cancel()
         try {
@@ -236,6 +323,7 @@ class DriverSession(
     // thread — the UDP receive thread never blocks on the TCP socket.
 
     private fun onData(fft: FloatArray, iq: FloatArray) {
+        if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq)) return
         val len = 8 + (fft.size + iq.size) * 4
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
@@ -248,6 +336,7 @@ class DriverSession(
     }
 
     private fun onDataRx(rx: Int, iq: FloatArray) {
+        if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq)) return
         val len = 8 + iq.size * 4
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
@@ -347,7 +436,11 @@ class DriverSession(
         when (frame.op) {
             DriverProto.CMD_HELLO -> {
                 val version = p.int
-                send { frames.writeHello(DriverProto.VERSION, DriverProto.FEAT_RX_STREAMS) }
+                val features = DriverProto.FEAT_RX_STREAMS or
+                    // ashmem SharedMemory needs API 27; older devices simply
+                    // never advertise the ring and stay on TCP frames.
+                    (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
+                send { frames.writeHello(DriverProto.VERSION, features) }
                 if (version != DriverProto.VERSION) {
                     Log.w(TAG, "protocol mismatch: app=$version host=${DriverProto.VERSION}")
                 }
@@ -375,6 +468,16 @@ class DriverSession(
                 scope.launch { openDevice(kind, host, port, flags) }
             }
             DriverProto.CMD_CLOSE -> closeDevice()
+
+            DriverProto.CMD_SHM_ATTACH -> {
+                val want = p.getBool()
+                // Only arm once the ring exists (binder handshake done); a
+                // request without it — or a detach — leaves/returns the data
+                // plane on plain TCP frames.
+                shmArmed = want && shmRing != null
+                send { frames.writeBool(DriverProto.EV_SHM_RESULT, shmArmed) }
+                Log.i(TAG, "shm data plane ${if (shmArmed) "armed" else "off"}")
+            }
 
             DriverProto.CMD_SET_FREQUENCY -> p.long.let { hz ->
                 flex?.setFrequency(hz)
@@ -446,8 +549,12 @@ class DriverSession(
                 val idx = p.int
                 val hz = p.long
                 hl2?.setRxFrequency(idx, hz)
+                g2?.setRxFrequency(idx, hz)
             }
-            DriverProto.CMD_SET_RX_STREAM_MASK -> hl2?.setRxStreamMask(p.int)
+            DriverProto.CMD_SET_RX_STREAM_MASK -> p.int.let { mask ->
+                hl2?.setRxStreamMask(mask)
+                g2?.setRxStreamMask(mask)
+            }
 
             // HL2
             DriverProto.CMD_HL2_SET_LNA -> hl2?.setLnaGain(p.int)
@@ -461,7 +568,13 @@ class DriverSession(
                 hl2?.setOpenCollectorOutputs(rx, tx)
             }
             DriverProto.CMD_HL2_SET_VNA_COUNT -> hl2?.setVnaCount(p.int)
-            DriverProto.CMD_HL2_SET_PURESIGNAL -> hl2?.setPureSignal(p.getBool())
+            // PureSignal: shared opcode across HPSDR radios — the HL2 flips
+            // the gateware routing bit, the G2 switches the reference DDC's
+            // input to the TX/DUC loopback (P2 DDC-specific packet).
+            DriverProto.CMD_HL2_SET_PURESIGNAL -> p.getBool().let { on ->
+                hl2?.setPureSignal(on)
+                g2?.setPureSignal(on)
+            }
             DriverProto.CMD_HL2_SET_CW_KEYER -> {
                 val en = p.getBool(); val wpm = p.int; val mode = p.int
                 val weight = p.int; val spacing = p.getBool(); val rev = p.getBool()
@@ -583,6 +696,7 @@ class DriverSession(
                         onDataReceived = ::onData,
                         onConnectionStatusChanged = onStatusGen,
                         onStatus = ::onG2Status,
+                        onDataRx = ::onDataRx,
                     )
                     g2 = c
                     c.connect()

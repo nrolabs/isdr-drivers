@@ -78,6 +78,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    testOptions {
+        // JVM harness tests drive the real network clients against the local
+        // radio emulators; android.util.Log / os.Process become no-ops.
+        unitTests.isReturnDefaultValues = true
+    }
     lint {
         disable += setOf(
             "ObsoleteSdkInt",

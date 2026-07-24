@@ -62,7 +62,37 @@ class DriverService : Service() {
     // this (background) driver process's scheduling importance to the
     // foreground app, keeping it off the OEM throttle cpuset (/abnormal on
     // Samsung) that starved IQ delivery and robotised the audio.
-    private val binder = android.os.Binder()
+    //
+    // It also carries the ONE transaction of the shared-memory IQ ring
+    // handshake (SHM_TRANSACT_GET_RING): the app proves ownership of its
+    // authenticated TCP session with the CMD_AUTH token and receives the
+    // ashmem fd + ring geometry. Data still flows per the wire contract —
+    // the binder never moves IQ, only the fd, once.
+    private val binder = object : android.os.Binder() {
+        override fun onTransact(
+            code: Int, data: android.os.Parcel, reply: android.os.Parcel?, flags: Int,
+        ): Boolean {
+            if (code != DriverProto.SHM_TRANSACT_GET_RING) {
+                return super.onTransact(code, data, reply, flags)
+            }
+            if (reply == null) return true
+            val token = try { data.readString() } catch (_: Exception) { null }
+            val session = token?.let { t ->
+                synchronized(sessions) { sessions.firstOrNull { it.ownsToken(t) } }
+            }
+            val ring = if (Build.VERSION.SDK_INT >= 27) session?.acquireShm() else null
+            if (ring == null) {
+                reply.writeInt(0)
+            } else {
+                val (shm, nSlots, slotBytes) = ring
+                reply.writeInt(1)
+                reply.writeInt(nSlots)
+                reply.writeInt(slotBytes)
+                shm.writeToParcel(reply, 0)
+            }
+            return true
+        }
+    }
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

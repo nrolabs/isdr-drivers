@@ -63,6 +63,44 @@ class G2ProtocolP2Test {
     }
 
     @Test
+    fun highPriorityCarriesAllSevenDdcNcos() {
+        val st = G2Protocol.ControlState()
+        for (n in 0 until G2Protocol.MAX_DDC) st.ddcFreqHz[n] = 7_000_000L + n * 100_000L
+        val p = G2Protocol.highPriorityPacket(st)
+        for (n in 0 until G2Protocol.MAX_DDC) {
+            assertEquals("DDC$n phase word",
+                G2Protocol.phaseWord(7_000_000L + n * 100_000L), be32(p, 9 + 4 * n))
+        }
+    }
+
+    @Test
+    fun ddcSpecificFramesByReceiverCountUpToSeven() {
+        val st = G2Protocol.ControlState().apply { receiverCount = 7; sampleRate = 96_000 }
+        val p = G2Protocol.rxSpecificPacket(st)
+        assertEquals(0x7F, p[7].toInt() and 0xFF)                    // 7 DDCs enabled
+        assertEquals(0, p[8].toInt())
+        for (n in 0 until 7) {
+            val b = 17 + 6 * n
+            assertEquals("DDC$n input = ADC0", 0, p[b].toInt())
+            assertEquals("DDC$n rate", 96, be16(p, b + 1))
+            assertEquals("DDC$n size", 24, p[b + 5].toInt())
+        }
+    }
+
+    @Test
+    fun pureSignalRoutesTheFeedbackDdcToTheDucLoopback() {
+        val st = G2Protocol.ControlState().apply {
+            receiverCount = 2; pureSignal = true; psFeedbackDdc = 1
+        }
+        val p = G2Protocol.rxSpecificPacket(st)
+        assertEquals(G2Protocol.DDC_INPUT_ADC0, p[17].toInt())        // DDC0 stays on the ADC
+        assertEquals(G2Protocol.DDC_INPUT_TX_FEEDBACK, p[23].toInt()) // DDC1 = DUC loopback
+        st.pureSignal = false; st.psFeedbackDdc = -1
+        val off = G2Protocol.rxSpecificPacket(st)
+        assertEquals(G2Protocol.DDC_INPUT_ADC0, off[23].toInt())
+    }
+
+    @Test
     fun ducSpecificCarriesTheFullHardwareKeyer() {
         val st = G2Protocol.ControlState().apply {
             cwEnabled = true; cwIambic = true; cwSidetone = true; cwBreakin = true
