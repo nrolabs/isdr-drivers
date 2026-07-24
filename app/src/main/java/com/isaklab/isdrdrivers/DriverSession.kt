@@ -173,11 +173,11 @@ class DriverSession(
      * dropped-and-counted on consumer lag). False = not armed or block too
      * big for a slot — caller falls back to the TCP frame path.
      */
-    private fun publishShm(type: Int, a: Int, fft: FloatArray, iq: FloatArray): Boolean {
+    private fun publishShm(type: Int, a: Int, fft: FloatArray, iq: FloatArray, tag: Int): Boolean {
         if (!shmArmed) return false
         val seq = synchronized(shmLock) {
             val ring = shmRing ?: return false
-            ring.tryPublish(type, a, fft, fft.size, iq, iq.size)
+            ring.tryPublish(type, a, fft, fft.size, iq, iq.size, tag)
         }
         if (seq == -2L) return false               // oversized: TCP fallback
         if (seq < 0) {                             // ring full: drop-newest, counted
@@ -332,9 +332,18 @@ class DriverSession(
     // may reuse their IQ arrays after we return) and enqueue for the writer
     // thread — the UDP receive thread never blocks on the TCP socket.
 
+    // Flush sequence (FEAT_SEQ_TAG): every EV_DATA gets the next seq and its
+    // preceding EV_DATA_RX siblings carry the SAME seq — the app pairs
+    // per-receiver blocks with the main block by tag, never by arrival
+    // order (an individually dropped rx frame used to pair a stale block).
+    // Data callbacks of one client share a thread, so a plain int suffices.
+    private var flushSeq = 0
+
     private fun onData(fft: FloatArray, iq: FloatArray) {
-        if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq)) return
-        val len = 8 + (fft.size + iq.size) * 4
+        val tag = flushSeq
+        flushSeq = (flushSeq + 1) and 0x7fffffff
+        if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq, tag)) return
+        val len = 12 + (fft.size + iq.size) * 4
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
         bb.putInt(fft.size)
@@ -342,17 +351,22 @@ class DriverSession(
         bb.position(bb.position() + fft.size * 4)
         bb.putInt(iq.size)
         bb.asFloatBuffer().put(iq)
+        bb.position(bb.position() + iq.size * 4)
+        bb.putInt(tag)
         enqueue(OutEntry(DriverProto.EV_DATA, b, len, null, droppable = true))
     }
 
     private fun onDataRx(rx: Int, iq: FloatArray) {
-        if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq)) return
-        val len = 8 + iq.size * 4
+        val tag = flushSeq                       // seq of the flush's EV_DATA
+        if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq, tag)) return
+        val len = 12 + iq.size * 4
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
         bb.putInt(rx)
         bb.putInt(iq.size)
         bb.asFloatBuffer().put(iq)
+        bb.position(bb.position() + iq.size * 4)
+        bb.putInt(tag)
         enqueue(OutEntry(DriverProto.EV_DATA_RX, b, len, null, droppable = true))
     }
 
@@ -447,6 +461,7 @@ class DriverSession(
             DriverProto.CMD_HELLO -> {
                 val version = p.int
                 val features = DriverProto.FEAT_RX_STREAMS or
+                    DriverProto.FEAT_SEQ_TAG or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
