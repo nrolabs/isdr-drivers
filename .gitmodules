@@ -13,3 +13,6 @@
 [submodule "proto"]
 	path = proto
 	url = ../isdr-proto
+[submodule "app/src/main/java/com/isaklab/libflexk"]
+	path = app/src/main/java/com/isaklab/libflexk
+	url = ../libflexk
