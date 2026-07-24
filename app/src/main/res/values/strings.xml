@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">iSDR Drivers</string>
     <string name="fmt_version">v%1$s · GPLv2+</string>
-    <string name="app_explainer">Hardware driver host for the iSDR app (RTL-SDR, HackRF, Hermes-Lite 2, ANAN). iSDR starts this service automatically when a radio is used — you only need this screen for troubleshooting.</string>
+    <string name="app_explainer">Hardware driver host for the iSDR app (RTL-SDR, HackRF, Hermes-Lite 2, ANAN, FlexRadio). iSDR starts this service automatically when a radio is used — you only need this screen for troubleshooting.</string>
     <string name="btn_start_service">Start driver service</string>
     <string name="btn_stop_service">Stop driver service</string>
     <string name="btn_source_code">Source code (GPL)</string>

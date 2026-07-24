@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">iSDR Drivers</string>
+    <string name="fmt_version">v%1$s · GPLv2+</string>
+    <string name="app_explainer">Host für die Hardware-Treiber der iSDR-App (RTL-SDR, HackRF, Hermes-Lite 2, ANAN, FlexRadio). iSDR startet diesen Dienst automatisch, sobald ein Funkgerät verwendet wird — dieser Bildschirm wird nur zur Diagnose benötigt.</string>
+    <string name="btn_start_service">Treiberdienst starten</string>
+    <string name="btn_stop_service">Treiberdienst stoppen</string>
+    <string name="btn_source_code">Quellcode (GPL)</string>
+    <string name="notification_channel">Treiberdienst</string>
+    <string name="notification_title">iSDR Drivers</string>
+    <string name="notification_text">Funkgeräte-Treiberdienst läuft</string>
+
+    <string name="status_service_running">Treiberdienst läuft</string>
+    <string name="status_service_stopped">Treiberdienst gestoppt</string>
+    <string name="status_no_radio">kein Funkgerät geöffnet</string>
+    <string name="fmt_radio">Funkgerät: %1$s</string>
+    <plurals name="fmt_sessions">
+        <item quantity="one">%d App verbunden</item>
+        <item quantity="other">%d Apps verbunden</item>
+    </plurals>
+</resources>

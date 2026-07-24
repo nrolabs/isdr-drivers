@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">iSDR Drivers</string>
+    <string name="fmt_version">v%1$s · GPLv2+</string>
+    <string name="app_explainer">Host dei driver hardware per l\'app iSDR (RTL-SDR, HackRF, Hermes-Lite 2, ANAN, FlexRadio). iSDR avvia questo servizio automaticamente quando si usa una radio — questa schermata serve solo per la diagnostica.</string>
+    <string name="btn_start_service">Avvia il servizio driver</string>
+    <string name="btn_stop_service">Arresta il servizio driver</string>
+    <string name="btn_source_code">Codice sorgente (GPL)</string>
+    <string name="notification_channel">Servizio driver</string>
+    <string name="notification_title">iSDR Drivers</string>
+    <string name="notification_text">Servizio driver radio in esecuzione</string>
+
+    <string name="status_service_running">Servizio driver in esecuzione</string>
+    <string name="status_service_stopped">Servizio driver arrestato</string>
+    <string name="status_no_radio">nessuna radio aperta</string>
+    <string name="fmt_radio">Radio: %1$s</string>
+    <plurals name="fmt_sessions">
+        <item quantity="one">%d app connessa</item>
+        <item quantity="many">%d app connesse</item>
+        <item quantity="other">%d app connesse</item>
+    </plurals>
+</resources>
