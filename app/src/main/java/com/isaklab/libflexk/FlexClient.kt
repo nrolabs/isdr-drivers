@@ -13,6 +13,7 @@ package com.isaklab.libflexk
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.FFTProcessor
+import com.isaklab.isdrdrivers.core.SpectrumWorker
 import com.isaklab.isdrdrivers.core.FloatRing
 import com.isaklab.isdrdrivers.core.SeqTracker
 import java.io.BufferedReader
@@ -72,6 +73,13 @@ class FlexClient(
 
     @Volatile var spectrumEnabled = true
     private var fft: FFTProcessor? = null
+    // Welch FFT off the VITA receive thread: an inline FFT stalls the socket
+    // read and drops DAX IQ packets. The receive thread only submits on the
+    // display cadence and delivers the last cached spectrum — audio never
+    // waits on the FFT.
+    private var spectrumWorker: SpectrumWorker? = null
+    private var lastFftTimeMs = 0L
+    private val fftIntervalMs = 80L
     private val iqOut = FloatArray(IQ_BLOCK)
     private var iqFill = 0
 
@@ -121,7 +129,7 @@ class FlexClient(
                     // Ride through ~GC-length stalls at full DAX IQ rate.
                     receiveBufferSize = 2 * 1024 * 1024
                 }
-                fft = FFTProcessor()
+                fft = FFTProcessor().also { spectrumWorker = SpectrumWorker(it).apply { start() } }
                 txDest = InetSocketAddress(
                     host, if (port > 0) port else FlexProtocol.COMMAND_PORT,
                 )
@@ -237,7 +245,7 @@ class FlexClient(
      */
     private fun concealGap(floats: Long) {
         var n = floats.coerceAtMost(IQ_BLOCK.toLong()).toInt() and 1.inv()
-        fft?.resetSmoothing()
+        spectrumWorker?.resetSmoothing()
         onRxGaps?.invoke(vitaSeq.gapEvents)
         Log.w(TAG, "vita gap: $floats floats lost (events=${vitaSeq.gapEvents})")
         while (n > 0) {
@@ -251,10 +259,21 @@ class FlexClient(
     private fun flushBlock() {
         val block = iqOut.copyOf()
         iqFill = 0
-        val spectrum = if (spectrumEnabled) {
-            fft?.computePowerSpectrum(block) ?: FloatArray(0)
-        } else FloatArray(0)
-        onDataReceived(spectrum, block)
+        if (!spectrumEnabled) {
+            onDataReceived(FloatArray(0), block)
+            return
+        }
+        // The display renders ~10 fps: on that cadence hand a copy of the block
+        // to the off-thread worker (submit copies internally); the FFT never
+        // runs on this receive thread. Deliver the IQ NOW with the last cached
+        // spectrum — audio must never wait on the FFT (spectrum may lag one
+        // frame, imperceptible at 10 fps).
+        val now = System.currentTimeMillis()
+        if (now - lastFftTimeMs >= fftIntervalMs) {
+            lastFftTimeMs = now
+            spectrumWorker?.submit(block, block.size / 2)
+        }
+        onDataReceived(spectrumWorker?.latest ?: FloatArray(0), block)
     }
 
     private fun deliverIq(buf: ByteArray, offset: Int, bytes: Int) {
@@ -396,6 +415,7 @@ class FlexClient(
     }
 
     private fun closeQuietly() {
+        spectrumWorker?.stop()
         try { tcp?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
         tcp = null; udp = null; writer = null
