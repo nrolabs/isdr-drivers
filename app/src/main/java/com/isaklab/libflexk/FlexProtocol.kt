@@ -43,6 +43,18 @@ object FlexProtocol {
     const val CLASS_WATERFALL = 0x8004
     const val CLASS_OPUS = 0x8005
     const val CLASS_IF_NARROW = 0x03E3
+
+    /** DAX TX audio (client->radio) rides the narrow IF-data class. */
+    const val CLASS_DAX_TX_AUDIO = CLASS_IF_NARROW
+
+    /** FlexLib information class in the VITA class-id word ("SL"). */
+    const val INFO_CLASS = 0x534C
+
+    /** Stereo float32 frames per DAX TX packet (TXAudioStream.cs pacing). */
+    const val TX_FRAMES_PER_PACKET = 128
+
+    /** DAX TX audio sample rate (frames/s, stereo interleaved). */
+    const val TX_AUDIO_RATE = 48_000
     const val CLASS_IF_WIDE_24 = 0x02E3
     const val CLASS_IF_WIDE_48 = 0x02E4
     const val CLASS_IF_WIDE_96 = 0x02E5
@@ -189,6 +201,29 @@ object FlexProtocol {
         val scale = 1.0f / 32768.0f
         for (i in 0 until n) out[i] = bb.float * scale
         return n
+    }
+
+    /**
+     * Encode a client->radio DAX TX audio packet: VITA IF-data preamble
+     * (header word, stream id, Flex class id — no timestamps, no trailer,
+     * mirroring VitaFlex.cs as the radio's data plane parses it) followed by
+     * [n] interleaved stereo float32 BE samples in `[-1,1]` from [samples].
+     * [count] is the 4-bit modulo-16 packet counter. Returns packet bytes.
+     */
+    fun encodeTxAudio(
+        streamId: Long, count: Int, samples: FloatArray, n: Int, out: ByteArray,
+    ): Int {
+        val words = 4 + n
+        val bb = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN)
+        bb.putInt(
+            (PKT_IF_DATA_STREAM shl 28) or (1 shl 27) or
+                ((count and 0xF) shl 16) or (words and 0xFFFF),
+        )
+        bb.putInt(streamId.toInt())
+        bb.putInt(FLEX_OUI)
+        bb.putInt((INFO_CLASS shl 16) or CLASS_DAX_TX_AUDIO)
+        for (i in 0 until n) bb.putFloat(samples[i])
+        return words * 4
     }
 
     /** True when the class code is one of the DAX-IQ WIDE rates. */

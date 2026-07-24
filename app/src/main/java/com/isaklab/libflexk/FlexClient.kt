@@ -13,6 +13,7 @@ package com.isaklab.libflexk
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.FFTProcessor
+import com.isaklab.isdrdrivers.core.FloatRing
 import com.isaklab.isdrdrivers.core.SeqTracker
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -32,7 +33,9 @@ import kotlin.concurrent.thread
  * the radio via `client udpport`).
  *
  * Host contract matches the other clients: interleaved float IQ in [-1,1]
- * plus a power spectrum, both via [onDataReceived]; TX is phase 2.
+ * plus a power spectrum, both via [onDataReceived]; transmit samples come in
+ * via [submitTxIq] (interleaved 48 kSps floats in [-1,1]) and go out as a
+ * paced DAX TX audio VITA stream while PTT is keyed.
  */
 class FlexClient(
     /** (power spectrum in dB, interleaved IQ i0,q0,…) */
@@ -55,6 +58,14 @@ class FlexClient(
 
     @Volatile private var panStreamId: Long = 0
     @Volatile private var daxIqStreamId: Long = 0
+    @Volatile private var daxTxStreamId: Long = 0
+    @Volatile private var pttOn = false
+    /** Where TX VITA goes: learned from the radio's own data-plane packets
+     *  (its source socket), falling back to the command host:port. */
+    @Volatile private var txDest: InetSocketAddress? = null
+    private val txLock = Any()
+    private val txQueue = FloatRing(FlexProtocol.TX_AUDIO_RATE * 4)
+    private var txSeq = 0                          // 4-bit VITA counter
     @Volatile private var sliceIndex = -1
     @Volatile private var centerMHz = 7.1
     @Volatile private var daxRate = 48000
@@ -111,7 +122,12 @@ class FlexClient(
                     receiveBufferSize = 2 * 1024 * 1024
                 }
                 fft = FFTProcessor()
+                txDest = InetSocketAddress(
+                    host, if (port > 0) port else FlexProtocol.COMMAND_PORT,
+                )
                 thread(name = "flex-vita") { vitaLoop() }
+                thread(name = "flex-tx") { txLoop() }
+                thread(name = "flex-keepalive") { keepaliveLoop() }
                 onConnectionStatusChanged(true, "FLEX @ $host")
                 // Handshake per Radio.cs: identify, tell our UDP port, subscribe,
                 // then build panadapter -> slice -> dax-iq (the RX MVP chain).
@@ -151,6 +167,16 @@ class FlexClient(
                 send("stream set 0x%X daxiq_rate=%d".format(daxIqStreamId, daxRate))
             }
         }
+        // TX chain: one DAX TX audio stream for the session; PTT stays
+        // refused until the radio hands us its id (no dead-carrier keying).
+        send("stream create type=dax_tx dax_channel=1") { code, msg ->
+            if (code == 0L) {
+                daxTxStreamId = msg.trim().removePrefix("0x").toLongOrNull(16) ?: 0
+                Log.i(TAG, "dax_tx stream 0x%X".format(daxTxStreamId))
+            } else {
+                Log.w(TAG, "dax_tx create failed: $msg")
+            }
+        }
     }
 
     private fun readLoop(reader: BufferedReader) {
@@ -184,6 +210,9 @@ class FlexClient(
                 val p = DatagramPacket(buf, buf.size)
                 sock.receive(p)
                 val v = FlexProtocol.parseVita(buf, p.length) ?: continue
+                // The radio's data plane answers from its VITA socket; TX
+                // audio goes back to that same endpoint.
+                (p.socketAddress as? InetSocketAddress)?.let { txDest = it }
                 if (!FlexProtocol.isWideIq(v.classCode)) continue
                 if (daxIqStreamId != 0L && v.streamId != daxIqStreamId) continue
                 // VITA 4-bit packet counter: conceal holes, drop late dups.
@@ -259,7 +288,89 @@ class FlexClient(
         if (sliceIndex >= 0) send("slice set $sliceIndex mode=${mode.uppercase()}")
     }
 
-    fun setPtt(on: Boolean) = send(if (on) "xmit 1" else "xmit 0")
+    /**
+     * Key/unkey the radio. Key-up is refused until the DAX TX stream exists —
+     * `xmit 1` without a modulation feed would put a dead carrier on the air.
+     * Unkey stops the feed first, then clears any queued samples.
+     */
+    fun setPtt(on: Boolean) {
+        if (on) {
+            if (daxTxStreamId == 0L) {
+                Log.w(TAG, "PTT refused: no DAX TX stream yet")
+                return
+            }
+            pttOn = true                       // feed running before keying
+            send("xmit 1")
+        } else {
+            send("xmit 0")
+            pttOn = false
+            synchronized(txLock) { txQueue.clear() }
+        }
+    }
+
+    /** Queue interleaved transmit samples (`[-1,1]`, 48 kSps pairs). */
+    fun submitTxIq(iq: FloatArray) {
+        synchronized(txLock) { txQueue.write(iq) }   // ring drops oldest itself
+    }
+
+    /**
+     * Paced DAX TX sender: while keyed, one VITA packet of
+     * [FlexProtocol.TX_FRAMES_PER_PACKET] stereo frames every
+     * frames/48000 s (underruns are zero-filled so the radio's stream never
+     * sees a sequence hole); the 4-bit counter is continuous for the whole
+     * session, so key/unkey cycles cause no gap at the radio.
+     */
+    private fun txLoop() {
+        val floatsPerPacket = FlexProtocol.TX_FRAMES_PER_PACKET * 2
+        val periodNs =
+            FlexProtocol.TX_FRAMES_PER_PACKET * 1_000_000_000L / FlexProtocol.TX_AUDIO_RATE
+        val samples = FloatArray(floatsPerPacket)
+        val pkt = ByteArray(16 + floatsPerPacket * 4)
+        var next = System.nanoTime()
+        while (running) {
+            if (!pttOn || daxTxStreamId == 0L) {
+                next = System.nanoTime() + periodNs
+                try { Thread.sleep(5) } catch (_: InterruptedException) {}
+                continue
+            }
+            synchronized(txLock) {
+                var i = 0
+                val have = minOf(txQueue.size, floatsPerPacket)
+                while (i < have) { samples[i] = txQueue.read(); i++ }
+                java.util.Arrays.fill(samples, i, floatsPerPacket, 0f)
+            }
+            val len = FlexProtocol.encodeTxAudio(
+                daxTxStreamId, txSeq, samples, floatsPerPacket, pkt,
+            )
+            txSeq = (txSeq + 1) and 0xF
+            val dst = txDest
+            val sock = udp
+            if (dst != null && sock != null) {
+                try {
+                    sock.send(DatagramPacket(pkt, len, dst))
+                } catch (e: Exception) {
+                    if (running) Log.w(TAG, "tx send: ${e.message}")
+                }
+            }
+            next += periodNs
+            val wait = next - System.nanoTime()
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait / 1_000_000, (wait % 1_000_000).toInt())
+                } catch (_: InterruptedException) {}
+            } else if (wait < -50_000_000) {
+                next = System.nanoTime()       // fell badly behind; resync
+            }
+        }
+    }
+
+    /** Control-plane keepalive (Radio.cs pings ~1 Hz to hold the session). */
+    private fun keepaliveLoop() {
+        while (running) {
+            try { Thread.sleep(1000) } catch (_: InterruptedException) {}
+            if (running) send("ping")
+        }
+    }
 
     fun setTxDrive(level: Int) =
         send("transmit set rfpower=${(level * 100 / 255).coerceIn(0, 100)}")
@@ -279,6 +390,7 @@ class FlexClient(
 
     fun disconnect() {
         running = false
+        pttOn = false
         try { writer?.write(4) } catch (_: Exception) {}   // dying gasp 0x04
         closeQuietly()
     }

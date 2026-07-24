@@ -423,6 +423,7 @@ class DriverSession(
                 g2?.setPaEnabled(on)
             }
             DriverProto.CMD_TX_IQ -> p.getFloats().let { iq ->
+                flex?.submitTxIq(iq)
                 hackRf?.submitTxIq(iq)
                 hl2?.submitTxIq(iq)
                 g2?.submitTxIq(iq)
