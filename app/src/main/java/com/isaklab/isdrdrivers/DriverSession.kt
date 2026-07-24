@@ -91,6 +91,7 @@ class DriverSession(
     private var rtlTcp: RTLTCPClient? = null
     private var rtlUsb: RTLUSBClient? = null
     private var hackRf: HackRfClient? = null
+    private var flex: com.isaklab.libflexk.FlexClient? = null
     private var hl2: Hl2Client? = null
     private var g2: G2Client? = null
 
@@ -235,6 +236,7 @@ class DriverSession(
             DriverProto.CMD_CLOSE -> closeDevice()
 
             DriverProto.CMD_SET_FREQUENCY -> p.long.let { hz ->
+                flex?.setFrequency(hz)
                 rtlTcp?.setFrequency(hz)
                 rtlUsb?.sendCommand(RTLCommand.SetFrequency(hz))
                 hackRf?.setFrequency(hz)
@@ -242,6 +244,7 @@ class DriverSession(
                 g2?.setFrequency(hz)
             }
             DriverProto.CMD_SET_SAMPLE_RATE -> p.int.let { hz ->
+                flex?.setSampleRate(hz)
                 rtlTcp?.setSampleRate(hz)
                 rtlUsb?.sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
                 hackRf?.setSampleRate(hz)
@@ -263,12 +266,14 @@ class DriverSession(
                 g2?.setTxFrequency(hz)
             }
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
+                flex?.setPtt(on)
                 hackRf?.setPtt(on)
                 hl2?.setPtt(on)
                 g2?.setPtt(on)
                 sendTxState()
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
+                flex?.setTxDrive(level)
                 hl2?.setTxDrive(level)
                 g2?.setTxDrive(level)
             }
@@ -400,6 +405,18 @@ class DriverSession(
                     hackRf = c
                     c.connect()
                 }
+                DriverProto.DEV_FLEX -> {
+                    val c = com.isaklab.libflexk.FlexClient(::onData, ::onStatus)
+                    flex = c
+                    val target = host.ifEmpty { c.discover()?.ip ?: "" }
+                    if (target.isEmpty()) {
+                        onStatus(false, "No FLEX found on the LAN")
+                        false
+                    } else {
+                        c.connect(target, port)
+                        true
+                    }
+                }
                 DriverProto.DEV_HL2 -> {
                     val c = Hl2Client(
                         host = host.ifEmpty { Hl2Client.BROADCAST },
@@ -437,6 +454,7 @@ class DriverSession(
         DriverProto.DEV_RTL_TCP -> "RTL-SDR (rtl_tcp)"
         DriverProto.DEV_RTL_USB -> "RTL-SDR (USB)"
         DriverProto.DEV_HACKRF -> "HackRF"
+        DriverProto.DEV_FLEX -> "FlexRadio"
         DriverProto.DEV_HL2 ->
             if (flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0) "ANAN (Protocol 1)"
             else "Hermes-Lite 2"
@@ -449,6 +467,7 @@ class DriverSession(
             hl2?.setPtt(false)
             g2?.setPtt(false)
             hackRf?.setPtt(false)
+            flex?.setPtt(false)
         } catch (_: Exception) {
         }
         try {
@@ -457,11 +476,13 @@ class DriverSession(
             hackRf?.disconnect()
             hl2?.disconnect()
             g2?.disconnect()
+            flex?.disconnect()
         } catch (_: Exception) {
         }
         rtlTcp = null
         rtlUsb = null
         hackRf = null
+        flex = null
         hl2 = null
         g2 = null
         DriverServiceState.update {
