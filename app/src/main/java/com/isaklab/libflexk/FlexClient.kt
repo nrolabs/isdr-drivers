@@ -13,6 +13,7 @@ package com.isaklab.libflexk
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.FFTProcessor
+import com.isaklab.isdrdrivers.core.SeqTracker
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
@@ -37,6 +38,8 @@ class FlexClient(
     /** (power spectrum in dB, interleaved IQ i0,q0,…) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
+    /** Fired (with the running total) whenever an RX stream gap is detected. */
+    private val onRxGaps: ((Long) -> Unit)? = null,
 ) {
     companion object {
         private const val TAG = "FlexClient"
@@ -60,6 +63,15 @@ class FlexClient(
     private var fft: FFTProcessor? = null
     private val iqOut = FloatArray(IQ_BLOCK)
     private var iqFill = 0
+
+    // VITA-49 4-bit packet counter continuity on the DAX IQ stream. A gap is
+    // concealed with zeros sized from the last payload; a late reordered
+    // packet is dropped (its samples would land out of order).
+    private val vitaSeq = SeqTracker(modulo = 16)
+    private var lastPayloadFloats = 0
+
+    /** RX discontinuity events (loss/reorder) since connect — telemetry. */
+    val rxGapCount: Long get() = vitaSeq.gapEvents
 
     /** Listen for one discovery broadcast; null on timeout. */
     fun discover(timeoutMs: Int = 4000): FlexProtocol.DiscoveredRadio? {
@@ -95,7 +107,8 @@ class FlexClient(
                 udp = DatagramSocket(null).apply {
                     reuseAddress = true
                     bind(InetSocketAddress(FlexProtocol.DATA_PORT))
-                    receiveBufferSize = 1 shl 20
+                    // Ride through ~GC-length stalls at full DAX IQ rate.
+                    receiveBufferSize = 2 * 1024 * 1024
                 }
                 fft = FFTProcessor()
                 thread(name = "flex-vita") { vitaLoop() }
@@ -173,6 +186,12 @@ class FlexClient(
                 val v = FlexProtocol.parseVita(buf, p.length) ?: continue
                 if (!FlexProtocol.isWideIq(v.classCode)) continue
                 if (daxIqStreamId != 0L && v.streamId != daxIqStreamId) continue
+                // VITA 4-bit packet counter: conceal holes, drop late dups.
+                val missing = vitaSeq.advance(v.packetCount.toLong())
+                if (missing == -1L) continue
+                if (missing > 0 && lastPayloadFloats > 0) {
+                    concealGap(missing * lastPayloadFloats)
+                }
                 deliverIq(buf, v.payloadOffset, v.payloadBytes)
             } catch (e: Exception) {
                 if (running) Log.w(TAG, "vita: ${e.message}")
@@ -182,21 +201,42 @@ class FlexClient(
 
     private val decodeScratch = FloatArray(IQ_BLOCK)
 
+    /**
+     * Insert [floats] zeros (capped at one delivery block) for a lost-packet
+     * hole so the audio path gets a dropout of about the right length, and
+     * restart the spectrum smoothing across the discontinuity.
+     */
+    private fun concealGap(floats: Long) {
+        var n = floats.coerceAtMost(IQ_BLOCK.toLong()).toInt() and 1.inv()
+        fft?.resetSmoothing()
+        onRxGaps?.invoke(vitaSeq.gapEvents)
+        Log.w(TAG, "vita gap: $floats floats lost (events=${vitaSeq.gapEvents})")
+        while (n > 0) {
+            val take = minOf(n, iqOut.size - iqFill)
+            java.util.Arrays.fill(iqOut, iqFill, iqFill + take, 0f)
+            iqFill += take; n -= take
+            if (iqFill >= iqOut.size) flushBlock()
+        }
+    }
+
+    private fun flushBlock() {
+        val block = iqOut.copyOf()
+        iqFill = 0
+        val spectrum = if (spectrumEnabled) {
+            fft?.computePowerSpectrum(block) ?: FloatArray(0)
+        } else FloatArray(0)
+        onDataReceived(spectrum, block)
+    }
+
     private fun deliverIq(buf: ByteArray, offset: Int, bytes: Int) {
         var decoded = FlexProtocol.decodeIfDataWide(buf, offset, bytes, decodeScratch)
+        if (decoded > 0) lastPayloadFloats = decoded
         var src = 0
         while (decoded > 0) {
             val take = minOf(decoded, iqOut.size - iqFill)
             System.arraycopy(decodeScratch, src, iqOut, iqFill, take)
             iqFill += take; src += take; decoded -= take
-            if (iqFill >= iqOut.size) {
-                val block = iqOut.copyOf()
-                iqFill = 0
-                val spectrum = if (spectrumEnabled) {
-                    fft?.computePowerSpectrum(block) ?: FloatArray(0)
-                } else FloatArray(0)
-                onDataReceived(spectrum, block)
-            }
+            if (iqFill >= iqOut.size) flushBlock()
         }
     }
 

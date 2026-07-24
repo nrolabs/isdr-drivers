@@ -65,6 +65,12 @@ class DriverSession(
     companion object {
         private const val TAG = "DriverSession"
 
+        /** Max queued outbound frames (~4.5 MB worst case of EV_DATA blocks). */
+        private const val MAX_OUT = 64
+
+        /** Encoded-frame buffers kept for reuse (see [bufPool]). */
+        private const val MAX_POOLED = 80
+
         /** Constant-time equality — never leak the token by comparison timing. */
         private fun tokensMatch(a: String, b: String): Boolean {
             val ab = a.toByteArray(Charsets.UTF_8)
@@ -95,8 +101,95 @@ class DriverSession(
     private var hl2: Hl2Client? = null
     private var g2: G2Client? = null
 
+    /**
+     * Client generation, bumped on every open/close. Driver callbacks carry
+     * the generation they were created for and are ignored once stale — so a
+     * replaced client's asynchronous "Disconnected" can never overwrite the
+     * new client's "Connected" (the disconnect path is async in every client).
+     */
+    private val clientGen = java.util.concurrent.atomic.AtomicInteger()
+
     fun start() {
         thread(name = "driver-session") { readLoop() }
+        thread(name = "driver-out") { writerLoop() }
+    }
+
+    // ---- outbound backpressure queue -------------------------------------
+    //
+    // Data-plane frames (EV_DATA / EV_DATA_RX / EV_SWEEP_BLOCK / telemetry)
+    // used to be written to the TCP socket directly from the UDP receive
+    // thread: a slow reader (app GC, saturated Wi-Fi backhaul) blocked the
+    // receive loop and the kernel dropped radio packets. Frames are now
+    // ENCODED at enqueue time (so drivers may reuse their IQ buffers) into
+    // pooled byte arrays and drained by a dedicated writer thread; when the
+    // queue is full the oldest droppable frame is discarded and counted.
+
+    private class OutEntry(
+        val op: Int,
+        val buf: ByteArray?,
+        val len: Int,
+        val run: (() -> Unit)?,
+        val droppable: Boolean,
+    )
+
+    private val outLock = Object()
+    private val outQueue = ArrayDeque<OutEntry>()
+    private val bufPool = ArrayDeque<ByteArray>()
+    @Volatile private var outDrops = 0L
+
+    private fun obtainBuf(min: Int): ByteArray {
+        synchronized(bufPool) {
+            val it = bufPool.iterator()
+            while (it.hasNext()) {
+                val b = it.next()
+                if (b.size >= min) { it.remove(); return b }
+            }
+        }
+        var cap = 1024
+        while (cap < min) cap = cap shl 1
+        return ByteArray(cap)
+    }
+
+    private fun recycleBuf(b: ByteArray) {
+        synchronized(bufPool) { if (bufPool.size < MAX_POOLED) bufPool.addLast(b) }
+    }
+
+    private fun enqueue(e: OutEntry) {
+        if (closed) { e.buf?.let(::recycleBuf); return }
+        synchronized(outLock) {
+            if (outQueue.size >= MAX_OUT) {
+                val idx = outQueue.indexOfFirst { it.droppable }
+                if (idx >= 0) {
+                    outQueue.removeAt(idx).buf?.let(::recycleBuf)
+                    outDrops++
+                    if (outDrops == 1L || outDrops % 100 == 0L) {
+                        Log.w(TAG, "outbound backpressure: $outDrops frames dropped")
+                    }
+                }
+                // No droppable entry (all control frames): grow past the cap —
+                // control frames are rare, tiny and must never be lost.
+            }
+            outQueue.addLast(e)
+            outLock.notify()
+        }
+    }
+
+    private fun writerLoop() {
+        try {
+            while (true) {
+                val e = synchronized(outLock) {
+                    while (outQueue.isEmpty() && !closed) outLock.wait()
+                    if (outQueue.isEmpty()) return   // closed and drained
+                    outQueue.removeFirst()
+                }
+                if (e.run != null) e.run.invoke()
+                else frames.writeRaw(e.op, e.buf!!, e.len)
+                e.buf?.let(::recycleBuf)
+            }
+        } catch (ex: Exception) {
+            if (!closed) Log.i(TAG, "outbound writer ended: ${ex.message}")
+            close()
+        }
     }
 
     private fun readLoop() {
@@ -118,6 +211,7 @@ class DriverSession(
         if (closed) return
         closed = true
         closeDevice()
+        synchronized(outLock) { outLock.notifyAll() }   // release the writer
         scope.cancel()
         try {
             socket.close()
@@ -137,53 +231,100 @@ class DriverSession(
         }
     }
 
-    private fun onData(fft: FloatArray, iq: FloatArray) = send { frames.writeData(fft, iq) }
-    private fun onDataRx(rx: Int, iq: FloatArray) = send { frames.writeDataRx(rx, iq) }
+    // Data-plane callbacks encode into pooled buffers at call time (drivers
+    // may reuse their IQ arrays after we return) and enqueue for the writer
+    // thread — the UDP receive thread never blocks on the TCP socket.
+
+    private fun onData(fft: FloatArray, iq: FloatArray) {
+        val len = 8 + (fft.size + iq.size) * 4
+        val b = obtainBuf(len)
+        val bb = java.nio.ByteBuffer.wrap(b)
+        bb.putInt(fft.size)
+        bb.asFloatBuffer().put(fft)
+        bb.position(bb.position() + fft.size * 4)
+        bb.putInt(iq.size)
+        bb.asFloatBuffer().put(iq)
+        enqueue(OutEntry(DriverProto.EV_DATA, b, len, null, droppable = true))
+    }
+
+    private fun onDataRx(rx: Int, iq: FloatArray) {
+        val len = 8 + iq.size * 4
+        val b = obtainBuf(len)
+        val bb = java.nio.ByteBuffer.wrap(b)
+        bb.putInt(rx)
+        bb.putInt(iq.size)
+        bb.asFloatBuffer().put(iq)
+        enqueue(OutEntry(DriverProto.EV_DATA_RX, b, len, null, droppable = true))
+    }
+
+    private fun onSweepBlock(lowerEdgeHz: Long, iq: FloatArray) {
+        val len = 12 + iq.size * 4
+        val b = obtainBuf(len)
+        val bb = java.nio.ByteBuffer.wrap(b)
+        bb.putLong(lowerEdgeHz)
+        bb.putInt(iq.size)
+        bb.asFloatBuffer().put(iq)
+        enqueue(OutEntry(DriverProto.EV_SWEEP_BLOCK, b, len, null, droppable = true))
+    }
 
     private fun onStatus(connected: Boolean, status: String) {
         DriverServiceState.update {
             it.copy(radioStatus = status, radioConnected = connected)
         }
-        send { frames.writeStatus(connected, status) }
+        // Through the queue (never dropped) so status stays ordered with the
+        // data frames around it.
+        enqueue(OutEntry(0, null, 0, { frames.writeStatus(connected, status) }, droppable = false))
     }
 
-    private fun onHl2Telemetry(t: Hl2Protocol.Telemetry) = send {
-        frames.writeTelemetry(
-            RadioTelemetry(
-                temperatureC = t.temperatureC, paCurrentA = t.paCurrentA,
-                forwardPower = t.forwardPower.toDouble(),
-                reversePower = t.reversePower.toDouble(),
-                supplyVolts = t.supplyVolts,
-                adcOverload = t.adcOverflow,
-                keyPtt = t.keyPtt, keyDot = t.keyDot, keyDash = t.keyDash,
-                hasTemperature = t.hasTemperature, hasCurrent = t.hasCurrent,
-                hasFwdPower = t.hasFwdPower, hasRevPower = t.hasRevPower,
-                hasSupplyVolts = t.hasSupplyVolts,
-                hasAdcOverload = t.hasAdcOverflow,
-                hasKeyInputs = true,
-            )
+    /** [onStatus] gated on the client generation it was created for. */
+    private fun statusFor(gen: Int): (Boolean, String) -> Unit = { connected, status ->
+        if (gen == clientGen.get()) onStatus(connected, status)
+    }
+
+    private fun sendTelemetry(t: RadioTelemetry) =
+        enqueue(OutEntry(0, null, 0, { frames.writeTelemetry(t) }, droppable = true))
+
+    private fun onHl2Telemetry(t: Hl2Protocol.Telemetry) = sendTelemetry(
+        RadioTelemetry(
+            temperatureC = t.temperatureC, paCurrentA = t.paCurrentA,
+            forwardPower = t.forwardPower.toDouble(),
+            reversePower = t.reversePower.toDouble(),
+            supplyVolts = t.supplyVolts,
+            adcOverload = t.adcOverflow,
+            keyPtt = t.keyPtt, keyDot = t.keyDot, keyDash = t.keyDash,
+            rxGaps = hl2?.rxGapCount ?: 0, linkDrops = outDrops,
+            hasTemperature = t.hasTemperature, hasCurrent = t.hasCurrent,
+            hasFwdPower = t.hasFwdPower, hasRevPower = t.hasRevPower,
+            hasSupplyVolts = t.hasSupplyVolts,
+            hasAdcOverload = t.hasAdcOverflow,
+            hasKeyInputs = true,
+            hasRxGaps = true, hasLinkDrops = true,
         )
-    }
+    )
 
-    private fun onG2Status(st: G2Protocol.Status) = send {
-        frames.writeTelemetry(
-            RadioTelemetry(
-                forwardPower = st.forwardPower.toDouble(),
-                reversePower = st.reversePower.toDouble(),
-                supplyVolts = st.supplyVolts,
-                exciterPower = st.exciterPower.toDouble(),
-                adcOverload = st.adcOverload,
-                pllLocked = st.pllLocked,
-                keyPtt = st.pttIn, keyDot = st.dot, keyDash = st.dash,
-                hasFwdPower = true, hasRevPower = true, hasSupplyVolts = true,
-                hasAdcOverload = true, hasPllLock = true,
-                hasExciterPower = true, hasKeyInputs = true,
-            )
+    private fun onG2Status(st: G2Protocol.Status) = sendTelemetry(
+        RadioTelemetry(
+            forwardPower = st.forwardPower.toDouble(),
+            reversePower = st.reversePower.toDouble(),
+            supplyVolts = st.supplyVolts,
+            exciterPower = st.exciterPower.toDouble(),
+            adcOverload = st.adcOverload,
+            pllLocked = st.pllLocked,
+            keyPtt = st.pttIn, keyDot = st.dot, keyDash = st.dash,
+            rxGaps = g2?.rxGapCount ?: 0, linkDrops = outDrops,
+            hasFwdPower = true, hasRevPower = true, hasSupplyVolts = true,
+            hasAdcOverload = true, hasPllLock = true,
+            hasExciterPower = true, hasKeyInputs = true,
+            hasRxGaps = true, hasLinkDrops = true,
         )
-    }
+    )
 
-    private fun onSweepBlock(lowerEdgeHz: Long, iq: FloatArray) =
-        send { frames.writeSweepBlock(lowerEdgeHz, iq) }
+    private fun onFlexGaps(gaps: Long) = sendTelemetry(
+        RadioTelemetry(
+            rxGaps = gaps, linkDrops = outDrops,
+            hasRxGaps = true, hasLinkDrops = true,
+        )
+    )
 
     private fun sendTxState() {
         val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting() ?: false
@@ -387,26 +528,31 @@ class DriverSession(
 
     private suspend fun openDevice(kind: Int, host: String, port: Int, flags: Int) {
         closeDevice()
+        // New client generation: stale callbacks from the replaced client
+        // (its disconnect is asynchronous) are filtered from here on, so its
+        // late "Disconnected" can never shadow this client's "Connected".
+        val gen = clientGen.incrementAndGet()
+        val onStatusGen = statusFor(gen)
         DriverServiceState.update { it.copy(radio = radioName(kind, flags)) }
         val ok = try {
             when (kind) {
                 DriverProto.DEV_RTL_TCP -> {
-                    val c = RTLTCPClient(host, port, ::onData, ::onStatus)
+                    val c = RTLTCPClient(host, port, ::onData, onStatusGen)
                     rtlTcp = c
                     c.connect()
                 }
                 DriverProto.DEV_RTL_USB -> {
-                    val c = RTLUSBClient(context, ::onData, ::onStatus)
+                    val c = RTLUSBClient(context, ::onData, onStatusGen)
                     rtlUsb = c
                     c.connect()
                 }
                 DriverProto.DEV_HACKRF -> {
-                    val c = HackRfClient(context, ::onData, ::onStatus)
+                    val c = HackRfClient(context, ::onData, onStatusGen)
                     hackRf = c
                     c.connect()
                 }
                 DriverProto.DEV_FLEX -> {
-                    val c = com.isaklab.libflexk.FlexClient(::onData, ::onStatus)
+                    val c = com.isaklab.libflexk.FlexClient(::onData, onStatusGen, ::onFlexGaps)
                     flex = c
                     val target = host.ifEmpty { c.discover()?.ip ?: "" }
                     if (target.isEmpty()) {
@@ -421,7 +567,7 @@ class DriverSession(
                     val c = Hl2Client(
                         host = host.ifEmpty { Hl2Client.BROADCAST },
                         onDataReceived = ::onData,
-                        onConnectionStatusChanged = ::onStatus,
+                        onConnectionStatusChanged = onStatusGen,
                         onDataRx = ::onDataRx,
                         onTelemetry = ::onHl2Telemetry,
                         port = if (port > 0) port else Hl2Protocol.PORT,
@@ -434,7 +580,7 @@ class DriverSession(
                     val c = G2Client(
                         host = host.ifEmpty { G2Client.BROADCAST },
                         onDataReceived = ::onData,
-                        onConnectionStatusChanged = ::onStatus,
+                        onConnectionStatusChanged = onStatusGen,
                         onStatus = ::onG2Status,
                     )
                     g2 = c
@@ -463,6 +609,11 @@ class DriverSession(
     }
 
     private fun closeDevice() {
+        // Invalidate the outgoing clients' callbacks FIRST: their disconnect
+        // paths are asynchronous and must not speak for the next client.
+        clientGen.incrementAndGet()
+        val hadClient = rtlTcp != null || rtlUsb != null || hackRf != null ||
+            flex != null || hl2 != null || g2 != null
         try {
             hl2?.setPtt(false)
             g2?.setPtt(false)
@@ -487,6 +638,12 @@ class DriverSession(
         g2 = null
         DriverServiceState.update {
             it.copy(radio = null, radioStatus = null, radioConnected = false)
+        }
+        // Deterministic close status: the clients' own "Disconnected" events
+        // are generation-filtered out, so emit the terminal status here, in
+        // order, before any successor's "Connected" can be enqueued.
+        if (hadClient && !closed) {
+            enqueue(OutEntry(0, null, 0, { frames.writeStatus(false, "Disconnected") }, droppable = false))
         }
     }
 }

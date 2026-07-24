@@ -1,7 +1,8 @@
 # libflexk
 
-Kotlin driver for **FlexRadio 6000-series** radios (FLEX-6300/6400/6600/6700),
-speaking the **SmartSDR network API** — TCP text command plane plus VITA-49
+Kotlin driver for **FlexRadio** radios — the FLEX-6000 series
+(6300/6400/6600/6700), the FLEX-8000 series and Aurora all speak the same
+**SmartSDR network API** — TCP text command plane plus VITA-49
 UDP data plane. Pure Kotlin — no NDK, no native libraries. Built for Android
 but the wire codec is Android-free and JVM-testable.
 

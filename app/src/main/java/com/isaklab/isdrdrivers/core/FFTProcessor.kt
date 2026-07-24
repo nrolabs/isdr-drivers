@@ -7,9 +7,22 @@ import kotlin.math.*
  * Computes a windowed power spectrum (in dB) from interleaved IQ samples for the
  * spectrum/waterfall display. Removes the DC component with a single-pole IIR,
  * applies a Hann window, FFT-shifts to center DC, and exponentially smooths the
- * result across frames. Reuses its FFT buffer to avoid per-call allocation.
+ * result across frames. Reuses its FFT buffers to avoid per-call allocation.
+ *
+ * Blocks larger than [fftSize] are Welch-averaged: 50 %-overlapped Hann
+ * segments spanning the WHOLE block, powers averaged before the dB
+ * conversion. The old single-segment path silently discarded everything past
+ * the first [fftSize] pairs — up to 7680-pair blocks showed only their first
+ * ~10 % on screen, and short signals landing later in a block never appeared.
+ * Same output size and call cadence as before; only the estimate improved
+ * (variance drops ~1/segments).
  */
 class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
+
+    companion object {
+        /** CPU ceiling: 32 segments of 800 pairs cover > 13k-pair blocks. */
+        private const val MAX_SEGMENTS = 32
+    }
 
     private val fft = DoubleFFT_1D(fftSize.toLong())
     private val window = DoubleArray(fftSize) { i ->
@@ -24,75 +37,81 @@ class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
     private val dcAlpha = 0.01
 
     private val fftInput = DoubleArray(fftSize * 2)
+    private val powerAcc = DoubleArray(fftSize)
 
     /**
      * Computes the shifted power spectrum in dB from interleaved IQ samples
-     * (i0, q0, i1, q1, ...). Uses at most [fftSize] pairs. Tracks and removes
-     * the DC component with a single-pole IIR before windowing.
+     * (i0, q0, i1, q1, ...), Welch-averaging over the whole block. Tracks and
+     * removes the DC component with a single-pole IIR before windowing.
+     * An empty block returns the previous spectrum (or a floor spectrum) —
+     * it must never poison the DC IIR with NaN (0/0).
      */
     fun computePowerSpectrum(iq: FloatArray, pairs: Int = iq.size / 2): FloatArray {
-        val size = min(fftSize, pairs)
-        java.util.Arrays.fill(fftInput, 0.0)
-
-        var sumI = 0.0
-        var sumQ = 0.0
-        for (i in 0 until size) {
-            sumI += iq[2 * i]
-            sumQ += iq[2 * i + 1]
-        }
-        val avgI = sumI / size
-        val avgQ = sumQ / size
-
-        dcI = dcI * (1 - dcAlpha) + avgI * dcAlpha
-        dcQ = dcQ * (1 - dcAlpha) + avgQ * dcAlpha
-
-        for (i in 0 until size) {
-            fftInput[2 * i] = (iq[2 * i] - dcI) * window[i]
-            fftInput[2 * i + 1] = (iq[2 * i + 1] - dcQ) * window[i]
+        val total = min(pairs, iq.size / 2)
+        if (total <= 0) {
+            // Guard: size==0 previously computed 0.0/0 → NaN into the DC IIR,
+            // permanently NaN-ing every later spectrum.
+            return previousSpectrum?.copyOf() ?: FloatArray(fftSize) { -120f }
         }
 
-        fft.complexForward(fftInput)
+        val hop = maxOf(1, fftSize / 2)
+        val segments = if (total <= fftSize) 1
+        else min(1 + (total - fftSize) / hop, MAX_SEGMENTS)
+
+        java.util.Arrays.fill(powerAcc, 0.0)
+        for (seg in 0 until segments) {
+            val off = seg * hop
+            val size = min(fftSize, total - off)
+            accumulateSegment(iq, off, size)
+        }
+        val norm = 1.0 / segments
 
         val spectrum = FloatArray(fftSize)
         val centerBin = fftSize / 2
-
         for (i in 0 until fftSize) {
             val shiftedIdx = (i + fftSize / 2) % fftSize
-            val real = fftInput[2 * i]
-            val imag = fftInput[2 * i + 1]
-            val power = (real * real + imag * imag) / fftSize
+            var power = powerAcc[i] * norm
 
-            var dbValue = if (power > 1e-20) {
+            if (shiftedIdx == centerBin && fftSize > 2) {
+                // Residual DC spike: replace the center bin with its
+                // neighbours' average, on the Welch-averaged powers.
+                val left = powerAcc[(i - 1 + fftSize) % fftSize] * norm
+                val right = powerAcc[(i + 1) % fftSize] * norm
+                power = (left + right) / 2
+            }
+
+            spectrum[shiftedIdx] = if (power > 1e-20) {
                 (10.0 * log10(power) - 60.0).toFloat()
             } else {
                 -120f
             }
-
-            if (shiftedIdx == centerBin && fftSize > 2) {
-                val leftPower = run {
-                    val li = (i - 1 + fftSize) % fftSize
-                    val lr = fftInput[2 * li]
-                    val lq = fftInput[2 * li + 1]
-                    (lr * lr + lq * lq) / fftSize
-                }
-                val rightPower = run {
-                    val ri = (i + 1) % fftSize
-                    val rr = fftInput[2 * ri]
-                    val rq = fftInput[2 * ri + 1]
-                    (rr * rr + rq * rq) / fftSize
-                }
-                val avgPower = (leftPower + rightPower) / 2
-                dbValue = if (avgPower > 1e-20) {
-                    (10.0 * log10(avgPower) - 60.0).toFloat()
-                } else {
-                    -120f
-                }
-            }
-
-            spectrum[shiftedIdx] = dbValue
         }
 
         return applySmoothing(spectrum)
+    }
+
+    /** One windowed, DC-corrected FFT of iq[off..off+size) into [powerAcc]. */
+    private fun accumulateSegment(iq: FloatArray, off: Int, size: Int) {
+        var sumI = 0.0
+        var sumQ = 0.0
+        for (i in 0 until size) {
+            sumI += iq[2 * (off + i)]
+            sumQ += iq[2 * (off + i) + 1]
+        }
+        dcI = dcI * (1 - dcAlpha) + (sumI / size) * dcAlpha
+        dcQ = dcQ * (1 - dcAlpha) + (sumQ / size) * dcAlpha
+
+        java.util.Arrays.fill(fftInput, 0.0)
+        for (i in 0 until size) {
+            fftInput[2 * i] = (iq[2 * (off + i)] - dcI) * window[i]
+            fftInput[2 * i + 1] = (iq[2 * (off + i) + 1] - dcQ) * window[i]
+        }
+        fft.complexForward(fftInput)
+        for (i in 0 until fftSize) {
+            val re = fftInput[2 * i]
+            val im = fftInput[2 * i + 1]
+            powerAcc[i] += (re * re + im * im) / fftSize
+        }
     }
 
     private fun applySmoothing(spectrum: FloatArray): FloatArray {
