@@ -110,6 +110,10 @@ class DriverSession(
     private var shmBuffer: java.nio.ByteBuffer? = null
     @Volatile private var shmRing: com.isaklab.isdrproto.ShmRing? = null
     @Volatile private var shmArmed = false
+    /** Serializes ring publishes (tryPublish is a non-atomic RMW on writeIdx,
+     *  and data/rx callbacks are not guaranteed to share a thread) and holds
+     *  off releaseShm's unmap while a publish is copying into the mapping. */
+    private val shmLock = Object()
 
     /** True for the authenticated session owning [token] (constant-time). */
     fun ownsToken(token: String): Boolean =
@@ -146,11 +150,15 @@ class DriverSession(
 
     private fun releaseShm() {
         shmArmed = false
-        shmRing = null
-        val buf = shmBuffer
-        shmBuffer = null
-        val shm = sharedMemory
-        sharedMemory = null
+        val buf: java.nio.ByteBuffer?
+        val shm: android.os.SharedMemory?
+        synchronized(shmLock) {       // no publish is mid-copy past this point
+            shmRing = null
+            buf = shmBuffer
+            shmBuffer = null
+            shm = sharedMemory
+            sharedMemory = null
+        }
         try {
             if (buf != null && android.os.Build.VERSION.SDK_INT >= 27) {
                 android.os.SharedMemory.unmap(buf)
@@ -167,8 +175,10 @@ class DriverSession(
      */
     private fun publishShm(type: Int, a: Int, fft: FloatArray, iq: FloatArray): Boolean {
         if (!shmArmed) return false
-        val ring = shmRing ?: return false
-        val seq = ring.tryPublish(type, a, fft, fft.size, iq, iq.size)
+        val seq = synchronized(shmLock) {
+            val ring = shmRing ?: return false
+            ring.tryPublish(type, a, fft, fft.size, iq, iq.size)
+        }
         if (seq == -2L) return false               // oversized: TCP fallback
         if (seq < 0) {                             // ring full: drop-newest, counted
             synchronized(outLock) { outDrops++ }
@@ -474,7 +484,15 @@ class DriverSession(
                 // Only arm once the ring exists (binder handshake done); a
                 // request without it — or a detach — leaves/returns the data
                 // plane on plain TCP frames.
-                shmArmed = want && shmRing != null
+                synchronized(shmLock) {
+                    val ring = shmRing
+                    // A fresh consumer starts from live data: release any
+                    // backlog a dead consumer left behind, otherwise a full
+                    // ring drops every publish and the new consumer never
+                    // receives its anchoring notify.
+                    if (want && ring != null) ring.resetForAttach()
+                    shmArmed = want && ring != null
+                }
                 send { frames.writeBool(DriverProto.EV_SHM_RESULT, shmArmed) }
                 Log.i(TAG, "shm data plane ${if (shmArmed) "armed" else "off"}")
             }
