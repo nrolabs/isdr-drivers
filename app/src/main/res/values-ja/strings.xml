@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">iSDR Drivers</string>
+    <string name="fmt_version">v%1$s · GPLv2+</string>
+    <string name="app_explainer">iSDRアプリ用ハードウェアドライバーのホストです（RTL-SDR、HackRF、Hermes-Lite 2、ANAN、FlexRadio）。無線機の使用時にiSDRがこのサービスを自動的に起動します。この画面はトラブルシューティングの際にのみ必要です。</string>
+    <string name="btn_start_service">ドライバーサービスを開始</string>
+    <string name="btn_stop_service">ドライバーサービスを停止</string>
+    <string name="btn_source_code">ソースコード（GPL）</string>
+    <string name="notification_channel">ドライバーサービス</string>
+    <string name="notification_title">iSDR Drivers</string>
+    <string name="notification_text">無線機ドライバーサービスを実行中</string>
+
+    <string name="status_service_running">ドライバーサービス実行中</string>
+    <string name="status_service_stopped">ドライバーサービス停止中</string>
+    <string name="status_no_radio">開いている無線機なし</string>
+    <string name="fmt_radio">無線機: %1$s</string>
+    <plurals name="fmt_sessions">
+        <item quantity="one">%d 個のアプリが接続中</item>
+        <item quantity="other">%d 個のアプリが接続中</item>
+    </plurals>
+</resources>

@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">iSDR Drivers</string>
+    <string name="fmt_version">v%1$s · GPLv2+</string>
+    <string name="app_explainer">iSDR 应用的硬件驱动宿主（RTL-SDR、HackRF、Hermes-Lite 2、ANAN、FlexRadio）。使用电台时 iSDR 会自动启动此服务 — 只有排查故障时才需要打开此界面。</string>
+    <string name="btn_start_service">启动驱动服务</string>
+    <string name="btn_stop_service">停止驱动服务</string>
+    <string name="btn_source_code">源代码（GPL）</string>
+    <string name="notification_channel">驱动服务</string>
+    <string name="notification_title">iSDR Drivers</string>
+    <string name="notification_text">电台驱动服务运行中</string>
+
+    <string name="status_service_running">驱动服务运行中</string>
+    <string name="status_service_stopped">驱动服务已停止</string>
+    <string name="status_no_radio">没有打开的电台</string>
+    <string name="fmt_radio">电台：%1$s</string>
+    <plurals name="fmt_sessions">
+        <item quantity="one">%d 个已连接应用</item>
+        <item quantity="other">%d 个已连接应用</item>
+    </plurals>
+</resources>

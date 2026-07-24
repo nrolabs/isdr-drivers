@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Driver-host foreground: an IC chip with pins — hardware plumbing, not
+     the radio itself — with a tiny spectrum trace inside to keep the family
+     resemblance. Amber body over the dark-green host background so the two
+     app icons are unmistakably different at a glance. Everything inside the
+     adaptive-icon safe zone (central ~66 dp of the 108 canvas). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Chip body fill: subtle amber gradient -->
+    <path android:pathData="M38,40 L70,40 Q74,40 74,44 L74,64 Q74,68 70,68 L38,68 Q34,68 34,64 L34,44 Q34,40 38,40 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54" android:startY="40"
+                android:endX="54" android:endY="68"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#33FFB300" />
+                <item android:offset="1.0" android:color="#14FFB300" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Chip outline -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M38,40 L70,40 Q74,40 74,44 L74,64 Q74,68 70,68 L38,68 Q34,68 34,64 L34,44 Q34,40 38,40 Z"
+        android:strokeWidth="4"
+        android:strokeColor="#FFB300"
+        android:strokeLineJoin="round" />
+
+    <!-- Pins: three per side, round caps -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M42,40 L42,33 M54,40 L54,33 M66,40 L66,33 M42,68 L42,75 M54,68 L54,75 M66,68 L66,75 M34,47 L27,47 M34,54 L27,54 M34,61 L27,61 M74,47 L81,47 M74,54 L81,54 M74,61 L81,61"
+        android:strokeWidth="4"
+        android:strokeColor="#FFB300"
+        android:strokeLineCap="round" />
+
+    <!-- Family mark: the little spectrum trace, inside the chip -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M41,59 L46,57 L50,50 L54,46 L58,50 L62,57 L67,59"
+        android:strokeWidth="3.5"
+        android:strokeColor="#00E676"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

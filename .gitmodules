@@ -1,0 +1,18 @@
+[submodule "app/src/main/java/com/isaklab/librtlsdrk"]
+	path = app/src/main/java/com/isaklab/librtlsdrk
+	url = ../librtlsdrk
+[submodule "app/src/main/java/com/isaklab/libhackrfk"]
+	path = app/src/main/java/com/isaklab/libhackrfk
+	url = ../libhackrfk
+[submodule "app/src/main/java/com/isaklab/libhl2sdrk"]
+	path = app/src/main/java/com/isaklab/libhl2sdrk
+	url = ../libhl2sdrk
+[submodule "app/src/main/java/com/isaklab/libg2sdrk"]
+	path = app/src/main/java/com/isaklab/libg2sdrk
+	url = ../libg2sdrk
+[submodule "proto"]
+	path = proto
+	url = ../isdr-proto
+[submodule "app/src/main/java/com/isaklab/libflexk"]
+	path = app/src/main/java/com/isaklab/libflexk
+	url = ../libflexk

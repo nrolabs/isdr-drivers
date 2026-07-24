@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed (monochrome) icon: the same chip-with-pins silhouette. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M38,40 L70,40 Q74,40 74,44 L74,64 Q74,68 70,68 L38,68 Q34,68 34,64 L34,44 Q34,40 38,40 Z"
+        android:strokeWidth="5"
+        android:strokeColor="#000000"
+        android:strokeLineJoin="round" />
+
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M42,40 L42,33 M54,40 L54,33 M66,40 L66,33 M42,68 L42,75 M54,68 L54,75 M66,68 L66,75 M34,47 L27,47 M34,54 L27,54 M34,61 L27,61 M74,47 L81,47 M74,54 L81,54 M74,61 L81,61"
+        android:strokeWidth="5"
+        android:strokeColor="#000000"
+        android:strokeLineCap="round" />
+
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M41,59 L46,57 L50,50 L54,46 L58,50 L62,57 L67,59"
+        android:strokeWidth="4"
+        android:strokeColor="#000000"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

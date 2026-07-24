@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Mirror of the iSDR design-system palette (keep in sync with
+     isdr-app/app/src/main/res/values/colors.xml + values-night). -->
+<resources>
+    <color name="background">#f8fafc</color>
+    <color name="cardBackground">#e2e8f0</color>
+    <color name="textPrimary">#0f172a</color>
+    <color name="textSecondary">#334155</color>
+    <color name="textTertiary">#64748b</color>
+    <color name="accentBlue">#3b82f6</color>
+    <color name="statusConnected">#10b981</color>
+    <color name="statusDisconnected">#ef4444</color>
+</resources>
