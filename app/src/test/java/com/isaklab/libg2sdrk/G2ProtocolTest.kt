@@ -78,9 +78,10 @@ class G2ProtocolTest {
         val p = G2Protocol.highPriorityPacket(st)
         assertEquals(G2Protocol.BUFLEN, p.size)
         assertEquals(0x03, p[4].toInt())                       // run | PTT
-        assertEquals(7_100_000L, G2Protocol.be32(p, 9))        // DDC0
-        assertEquals(14_200_000L, G2Protocol.be32(p, 13))      // DDC1
-        assertEquals(7_093_500L, G2Protocol.be32(p, 329))      // DUC0
+        // NCO phase words (saturnregisters.c IsDeltaPhase=true), never raw Hz.
+        assertEquals(G2Protocol.phaseWord(7_100_000), G2Protocol.be32(p, 9))    // DDC0
+        assertEquals(G2Protocol.phaseWord(14_200_000), G2Protocol.be32(p, 13))  // DDC1
+        assertEquals(G2Protocol.phaseWord(7_093_500), G2Protocol.be32(p, 329))  // DUC
         assertEquals(200, p[345].toInt() and 0xFF)
         assertEquals(0b0000100, (p[1401].toInt() and 0xFF) shr 1)   // OC on C bits 1-7
         assertEquals(0, p[1403].toInt())                       // 1403 unread by p2app
@@ -110,10 +111,11 @@ class G2ProtocolTest {
         assertEquals(G2Protocol.Alex.RX_PREAMP_6M, G2Protocol.rxFilterWord(50_100_000))
         assertEquals(G2Protocol.Alex.RX_BYPASS, G2Protocol.rxFilterWord(475_000))
 
-        // Serialized as four BE u16 registers: 1428/1432 TX, 1430 RX2, 1434 RX1.
+        // Four BE u16 registers: 1428 TX filt+ant, 1430 RX2, 1432 RX ANTENNA
+        // (new-client path — not a TX copy), 1434 RX1.
         val p = G2Protocol.highPriorityPacket(st)
         assertEquals(0x0920, G2Protocol.be16(p, 1428))
-        assertEquals(0x0920, G2Protocol.be16(p, 1432))
+        assertEquals(G2Protocol.Alex.TX_ANT_1, G2Protocol.be16(p, 1432))
         assertEquals(0x0000, G2Protocol.be16(p, 1430))          // RX2 off
         assertEquals(0x0010, G2Protocol.be16(p, 1434))
 
