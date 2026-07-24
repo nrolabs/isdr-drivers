@@ -46,7 +46,13 @@ class DriverActivity : AppCompatActivity() {
             ContextCompat.startForegroundService(this, Intent(this, DriverService::class.java))
         }
         findViewById<Button>(R.id.btnStop).setOnClickListener {
-            stopService(Intent(this, DriverService::class.java))
+            // Explicit stop action: plain stopService is inert while the
+            // iSDR app keeps the service bound (shm binder) — the button
+            // looked dead exactly when a client was attached.
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, DriverService::class.java).setAction(DriverService.ACTION_STOP),
+            )
         }
         findViewById<Button>(R.id.btnSource).setOnClickListener {
             startActivity(

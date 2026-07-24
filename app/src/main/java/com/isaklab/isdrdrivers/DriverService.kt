@@ -45,6 +45,9 @@ class DriverService : Service() {
         private const val NOTIFICATION_ID = 1
         const val EXTRA_LAN = "lan"
         const val EXTRA_TOKEN = "token"
+        /** Explicit stop: tears sessions/server down even while a client
+         *  keeps the service BOUND (plain stopService is inert then). */
+        const val ACTION_STOP = "com.isaklab.isdrdrivers.STOP"
         private const val MAX_SESSIONS = 4
         private const val AUTH_TIMEOUT_MS = 5000
     }
@@ -96,6 +99,27 @@ class DriverService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            // Manual stop from the status screen. The iSDR app holds a
+            // BINDING (shm handshake binder), so stopService alone never
+            // reached onDestroy and the button looked dead: tear the data
+            // plane down explicitly, drop the notification, and let the
+            // process die when the client unbinds. If iSDR is still in use
+            // it will simply restart the host — documented behaviour.
+            stopping = true
+            try {
+                server?.close()
+            } catch (_: Exception) {
+            }
+            server = null
+            synchronized(sessions) { sessions.toList() }.forEach { it.close() }
+            sessions.clear()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            DriverServiceState.update { DriverServiceState.Snapshot() }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        stopping = false
         // A later start with LAN mode re-binds; localhost mode never opens the
         // network. The token gates every LAN session (see DriverSession).
         val wantLan = intent?.getBooleanExtra(EXTRA_LAN, false) == true
