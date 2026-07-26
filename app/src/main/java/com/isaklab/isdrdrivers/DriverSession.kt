@@ -193,7 +193,12 @@ class DriverSession(
     private var rtlTcp: RTLTCPClient? = null
     private var rtlUsb: RTLUSBClient? = null
     private var hackRf: HackRfClient? = null
-    private var flex: com.isaklab.libflexk.FlexClient? = null
+    // FLEX SUPPORT IS OFF. libflexk is a private repository and is no longer a
+    // submodule of this driver, so nothing here may name its types — a clone
+    // without access must still build. Every call site below is commented out
+    // rather than deleted: turning support back on is re-adding the submodule
+    // and uncommenting, not rewriting the session from memory.
+    // private var flex: com.isaklab.libflexk.FlexClient? = null
     private var hl2: Hl2Client? = null
     private var g2: G2Client? = null
 
@@ -432,12 +437,15 @@ class DriverSession(
         )
     )
 
-    private fun onFlexGaps(gaps: Long) = sendTelemetry(
-        RadioTelemetry(
-            rxGaps = gaps, linkDrops = outDrops,
-            hasRxGaps = true, hasLinkDrops = true,
-        )
-    )
+    // Only the FLEX client fed this, so it is commented out with the rest of
+    // the FLEX path — an unused private function is a compiler warning, and
+    // this repo treats warnings as a gate.
+    // private fun onFlexGaps(gaps: Long) = sendTelemetry(
+    //     RadioTelemetry(
+    //         rxGaps = gaps, linkDrops = outDrops,
+    //         hasRxGaps = true, hasLinkDrops = true,
+    //     )
+    // )
 
     private fun sendTxState() {
         val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting() ?: false
@@ -513,7 +521,7 @@ class DriverSession(
             }
 
             DriverProto.CMD_SET_FREQUENCY -> p.long.let { hz ->
-                flex?.setFrequency(hz)
+                // flex?.setFrequency(hz)
                 rtlTcp?.setFrequency(hz)
                 rtlUsb?.sendCommand(RTLCommand.SetFrequency(hz))
                 hackRf?.setFrequency(hz)
@@ -521,7 +529,7 @@ class DriverSession(
                 g2?.setFrequency(hz)
             }
             DriverProto.CMD_SET_SAMPLE_RATE -> p.int.let { hz ->
-                flex?.setSampleRate(hz)
+                // flex?.setSampleRate(hz)
                 rtlTcp?.setSampleRate(hz)
                 rtlUsb?.sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
                 hackRf?.setSampleRate(hz)
@@ -543,14 +551,14 @@ class DriverSession(
                 g2?.setTxFrequency(hz)
             }
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
-                flex?.setPtt(on)
+                // flex?.setPtt(on)
                 hackRf?.setPtt(on)
                 hl2?.setPtt(on)
                 g2?.setPtt(on)
                 sendTxState()
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
-                flex?.setTxDrive(level)
+                // flex?.setTxDrive(level)
                 hl2?.setTxDrive(level)
                 g2?.setTxDrive(level)
             }
@@ -559,7 +567,7 @@ class DriverSession(
                 g2?.setPaEnabled(on)
             }
             DriverProto.CMD_TX_IQ -> p.getFloats().let { iq ->
-                flex?.submitTxIq(iq)
+                // flex?.submitTxIq(iq)
                 hackRf?.submitTxIq(iq)
                 hl2?.submitTxIq(iq)
                 g2?.submitTxIq(iq)
@@ -699,16 +707,24 @@ class DriverSession(
                     c.connect()
                 }
                 DriverProto.DEV_FLEX -> {
-                    val c = com.isaklab.libflexk.FlexClient(::onData, onStatusGen, ::onFlexGaps)
-                    flex = c
-                    val target = host.ifEmpty { c.discover()?.ip ?: "" }
-                    if (target.isEmpty()) {
-                        onStatus(false, "No FLEX found on the LAN")
-                        false
-                    } else {
-                        c.connect(target, port)
-                        true
-                    }
+                    // Support withdrawn (libflexk is private and unbundled).
+                    // It answers with a REFUSAL rather than falling through to
+                    // the "unknown device" path: the app can still ask for a
+                    // FLEX, and an operator who does deserves to be told the
+                    // driver dropped it, not left watching a connect that
+                    // never completes.
+                    onStatus(false, "FlexRadio support is not available in this build")
+                    false
+                    // val c = com.isaklab.libflexk.FlexClient(::onData, onStatusGen, ::onFlexGaps)
+                    // flex = c
+                    // val target = host.ifEmpty { c.discover()?.ip ?: "" }
+                    // if (target.isEmpty()) {
+                    //     onStatus(false, "No FLEX found on the LAN")
+                    //     false
+                    // } else {
+                    //     c.connect(target, port)
+                    //     true
+                    // }
                 }
                 DriverProto.DEV_HL2 -> {
                     val c = Hl2Client(
@@ -761,12 +777,12 @@ class DriverSession(
         // paths are asynchronous and must not speak for the next client.
         clientGen.incrementAndGet()
         val hadClient = rtlTcp != null || rtlUsb != null || hackRf != null ||
-            flex != null || hl2 != null || g2 != null
+            hl2 != null || g2 != null
         try {
             hl2?.setPtt(false)
             g2?.setPtt(false)
             hackRf?.setPtt(false)
-            flex?.setPtt(false)
+            // flex?.setPtt(false)
         } catch (_: Exception) {
         }
         try {
@@ -775,13 +791,13 @@ class DriverSession(
             hackRf?.disconnect()
             hl2?.disconnect()
             g2?.disconnect()
-            flex?.disconnect()
+            // flex?.disconnect()
         } catch (_: Exception) {
         }
         rtlTcp = null
         rtlUsb = null
         hackRf = null
-        flex = null
+        // flex = null
         hl2 = null
         g2 = null
         DriverServiceState.update {
