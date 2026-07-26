@@ -278,6 +278,37 @@ class Hl2ProtocolTest {
     }
 
     @Test
+    fun rxFrame_swapsForwardAndReverseWhenTheBoardReportsThemBackwards() {
+        // Measured on a real HL2 (fw 74) into a DUMMY LOAD at drive 60:
+        // fwd 23 / rev 36. Reverse above forward on a matched load is not
+        // physics, it is the board reporting the pair the other way round —
+        // hl2.cxx:1220 guards against exactly this ("forward and reverse
+        // power could be backwards"). MainActivity derives the PA's SWR
+        // protection from these two, so getting it wrong either invents a
+        // huge SWR on a good load or hides a real mismatch.
+        fun frame(bank1Fwd: Int, bank2Rev: Int): ByteArray {
+            val b = ByteArray(Hl2Protocol.FRAME)
+            b[0] = 0xEF.toByte(); b[1] = 0xFE.toByte(); b[2] = 0x01; b[3] = 0x06
+            b[8] = 0x7F; b[9] = 0x7F; b[10] = 0x7F
+            b[11] = (1 shl 3).toByte()               // bank 1: temp + fwd
+            b[14] = (bank1Fwd shr 8).toByte(); b[15] = bank1Fwd.toByte()
+            b[520] = 0x7F; b[521] = 0x7F; b[522] = 0x7F
+            b[523] = (2 shl 3).toByte()              // bank 2: rev + current
+            b[524] = (bank2Rev shr 8).toByte(); b[525] = bank2Rev.toByte()
+            return b
+        }
+
+        val backwards = Hl2Protocol.parseRxFrame(frame(23, 36), 1) { _, _, _ -> }
+        assertEquals("the larger reading is the forward one", 36, backwards.forwardPower)
+        assertEquals(23, backwards.reversePower)
+
+        // A board that reports them the right way round must be left alone.
+        val correct = Hl2Protocol.parseRxFrame(frame(400, 12), 1) { _, _, _ -> }
+        assertEquals(400, correct.forwardPower)
+        assertEquals(12, correct.reversePower)
+    }
+
+    @Test
     fun txSamples_streamedWhenTransmitting() {
         val st = Hl2Protocol.ControlState().apply { mox = true }
         val iVal = 12345; val qVal = -9876
