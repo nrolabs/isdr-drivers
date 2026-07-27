@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Network radios (HL2 / ANAN-G2 / rtl_tcp) -->
+    <!-- Radios reached over the network -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- connectedDevice FGS eligibility on Android 14+ -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
@@ -15,7 +15,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- USB host: RTL-SDR dongles and HackRF boards -->
+    <!-- Radios attached over USB -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <application

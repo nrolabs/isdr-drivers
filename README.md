@@ -1,11 +1,13 @@
 # iSDR Drivers
 
-Hardware driver host for the **iSDR** app. This APK contains the GPL radio
-drivers — [librtlsdrk](https://github.com/nrolabs/librtlsdrk),
-[libhackrfk](https://github.com/nrolabs/libhackrfk),
-[libhl2sdrk](https://github.com/nrolabs/libhl2sdrk) and
-[libg2sdrk](https://github.com/nrolabs/libg2sdrk) — behind a small foreground
-service (`DriverService`) that the iSDR app drives over a loopback TCP socket.
+Hardware driver host for the **iSDR** app. This APK carries the GPL radio
+drivers, each its own `lib*k` submodule under
+`app/src/main/java/com/isaklab/`, behind a small foreground service
+(`DriverService`) that the iSDR app drives over a loopback TCP socket.
+
+Which radios are actually supported is whatever `.gitmodules` and
+`DeviceType` say at the time — deliberately not restated here, so adding or
+withdrawing a driver never leaves a stale claim behind.
 
 The host is deliberately dumb: it moves raw IQ samples and hardware control
 commands only. All signal processing (demodulation, filtering, digital modes,

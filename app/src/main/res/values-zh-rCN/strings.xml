@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">iSDR Drivers</string>
     <string name="fmt_version">v%1$s · GPLv2+</string>
-    <string name="app_explainer">iSDR 应用的硬件驱动宿主（RTL-SDR、HackRF、Hermes-Lite 2、ANAN、FlexRadio）。使用电台时 iSDR 会自动启动此服务 — 只有排查故障时才需要打开此界面。</string>
+    <string name="app_explainer">iSDR 应用的硬件驱动宿主。使用电台时 iSDR 会自动启动此服务 — 只有排查故障时才需要打开此界面。</string>
     <string name="btn_start_service">启动驱动服务</string>
     <string name="btn_stop_service">停止驱动服务</string>
     <string name="btn_source_code">源代码（GPL）</string>

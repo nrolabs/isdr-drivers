@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">iSDR Drivers</string>
     <string name="fmt_version">v%1$s · GPLv2+</string>
-    <string name="app_explainer">Хост аппаратных драйверов для приложения iSDR (RTL-SDR, HackRF, Hermes-Lite 2, ANAN, FlexRadio). iSDR запускает эту службу автоматически при использовании радио — этот экран нужен только для диагностики.</string>
+    <string name="app_explainer">Хост аппаратных драйверов для приложения iSDR. iSDR запускает эту службу автоматически при использовании радио — этот экран нужен только для диагностики.</string>
     <string name="btn_start_service">Запустить службу драйверов</string>
     <string name="btn_stop_service">Остановить службу драйверов</string>
     <string name="btn_source_code">Исходный код (GPL)</string>
