@@ -17,7 +17,6 @@ package com.isaklab.isdrdrivers
 
 import android.content.Context
 import android.util.Log
-import com.isaklab.isdrdrivers.core.DspThread
 import com.isaklab.isdrproto.Frame
 import com.isaklab.isdrproto.Frames
 import com.isaklab.isdrproto.DriverProto
@@ -161,12 +160,10 @@ class DriverSession(
             sharedMemory = null
         }
         try {
-            // Both calls are API 27+, and a SharedMemory only ever exists there;
-            // the explicit guard is what lint needs to see around close() too.
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
-                if (buf != null) android.os.SharedMemory.unmap(buf)
-                shm?.close()
+            if (buf != null && android.os.Build.VERSION.SDK_INT >= 27) {
+                android.os.SharedMemory.unmap(buf)
             }
+            shm?.close()
         } catch (_: Exception) {
         }
     }
@@ -215,18 +212,7 @@ class DriverSession(
 
     fun start() {
         thread(name = "driver-session") { readLoop() }
-        // The writer is the LAST hop before the app: every IQ block the radio
-        // produced reaches the host through it. It used to run at the default
-        // priority, below the radio loops AND below anything else the platform
-        // felt like scheduling — measured on an A30 it had accumulated 27 s of
-        // runqueue wait, which lands in the audio as gaps. Audio priority, one
-        // notch below the radio loops that must not miss a packet.
-        thread(name = "driver-out") {
-            try {
-                android.os.Process.setThreadPriority(DspThread.PRIORITY_DELIVERY)
-            } catch (_: Throwable) {}
-            writerLoop()
-        }
+        thread(name = "driver-out") { writerLoop() }
     }
 
     // ---- outbound backpressure queue -------------------------------------

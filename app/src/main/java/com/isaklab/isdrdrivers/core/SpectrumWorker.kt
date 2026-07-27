@@ -21,11 +21,6 @@ class SpectrumWorker(private val fft: FFTProcessor) {
     private class Job(val iq: FloatArray, val pairs: Int)
 
     private val queue = ArrayBlockingQueue<Job>(1)
-
-    // Double buffer for submit(): the queue holds at most one job, so two
-    // buffers are enough to never hand the worker the one being refilled.
-    private val scratch = arrayOfNulls<FloatArray>(2)
-    private var scratchIndex = 0
     @Volatile private var running = false
     private var thread: Thread? = null
 
@@ -43,28 +38,13 @@ class SpectrumWorker(private val fft: FFTProcessor) {
         }, "spectrum-fft").also { it.start() }
     }
 
-    /**
-     * Hand a COPY of the block to the worker (drop-oldest if it's busy).
-     *
-     * The copy is unavoidable — the caller reuses its accumulator the moment
-     * this returns — but ALLOCATING it is not. Two buffers alternate: while
-     * the worker reads one, the receive thread fills the other, so a display
-     * cadence that ran for an hour allocates twice instead of 36000 times.
-     * Only the receive thread calls this, so the alternation needs no lock.
-     */
+    /** Hand a COPY of the block to the worker (drop-oldest if it's busy). */
     fun submit(block: FloatArray, pairs: Int) {
         if (!running) return
-        val n = block.size
-        var buf = scratch[scratchIndex]
-        if (buf == null || buf.size != n) {
-            buf = FloatArray(n)
-            scratch[scratchIndex] = buf
-        }
-        System.arraycopy(block, 0, buf, 0, n)
-        scratchIndex = scratchIndex xor 1
+        val copy = block.copyOf()
         // Latest-wins: clear any pending stale job, enqueue this one.
         queue.clear()
-        queue.offer(Job(buf, pairs))
+        queue.offer(Job(copy, pairs))
     }
 
     fun resetSmoothing() = fft.resetSmoothing()

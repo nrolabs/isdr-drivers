@@ -83,13 +83,8 @@ class DriverService : Service() {
             val session = token?.let { t ->
                 synchronized(sessions) { sessions.firstOrNull { it.ownsToken(t) } }
             }
-            // SharedMemory (and its Parcel handle) is API 27+; the ring is only
-            // ever acquired there. The version check is repeated at the write
-            // because lint cannot see that `ring != null` already implies it.
-            val ring = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                session?.acquireShm()
-            } else null
-            if (ring == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) {
+            val ring = if (Build.VERSION.SDK_INT >= 27) session?.acquireShm() else null
+            if (ring == null) {
                 reply.writeInt(0)
             } else {
                 val (shm, nSlots, slotBytes) = ring
