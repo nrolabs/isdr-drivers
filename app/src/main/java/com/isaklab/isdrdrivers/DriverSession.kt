@@ -217,6 +217,7 @@ class DriverSession(
 
     fun start() {
         thread(name = "driver-session") { readLoop() }
+        startTxWatchdog()
         // The writer is the LAST hop before the app: every IQ block the radio
         // produced reaches the host through it. It used to run at the default
         // priority, below the radio loops AND below anything else the platform
@@ -361,6 +362,52 @@ class DriverSession(
     private var flushSeq = 0
 
 
+
+    // ---- transmit watchdog -------------------------------------------------
+    //
+    // The link can die without anyone being told. A phone that loses its
+    // network mid-over sends no FIN: the relay holds the spliced pair for its
+    // whole idle timeout, the station stays blocked on a read, and nothing
+    // runs closeDevice() — so the radio can sit KEYED for minutes, into an
+    // antenna, with no operator present. That is a burnt PA and an occupied
+    // channel, not an inconvenience.
+    //
+    // Every path that keys PTT streams transmit samples continuously (voice,
+    // digital, and the VNA sweep's carrier pump), so their absence is a
+    // reliable proxy for "the far end is gone". The watchdog arms on the
+    // FIRST sample after key-up rather than on key-up itself, so a mode that
+    // legitimately keys without a stream of its own is never cut short.
+    //
+    // This is deliberately in the driver host: it is the last process that
+    // still holds the radio, and it protects regardless of how the link died.
+    @Volatile private var pttOn = false
+    @Volatile private var lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
+
+    private fun startTxWatchdog() {
+        scope.launch {
+            while (!closed) {
+                kotlinx.coroutines.delay(250)
+                val last = lastTxIqMs
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (!com.isaklab.isdrdrivers.core.TxWatchdogPolicy
+                        .shouldUnkey(pttOn, last, now)
+                ) {
+                    continue
+                }
+                Log.w(TAG, "transmit watchdog: no IQ for ${now - last} ms while keyed — unkeying")
+                pttOn = false
+                lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
+                try {
+                    hackRf?.setPtt(false)
+                    hl2?.setPtt(false)
+                    g2?.setPtt(false)
+                } catch (e: Exception) {
+                    Log.e(TAG, "watchdog could not unkey: ${e.message}")
+                }
+                runCatching { sendTxState() }
+            }
+        }
+    }
 
     /** Last spectrum actually put on the wire; see [onData]. */
     private var lastSentSpectrum: FloatArray? = null
@@ -596,6 +643,11 @@ class DriverSession(
                 hackRf?.setPtt(on)
                 hl2?.setPtt(on)
                 g2?.setPtt(on)
+                pttOn = on
+                // Cleared either way: the watchdog re-arms only when transmit
+                // samples actually start flowing, so a mode that keys without
+                // a stream of its own is never cut short by it.
+                lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
                 sendTxState()
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
@@ -612,6 +664,7 @@ class DriverSession(
                 hackRf?.submitTxIq(iq)
                 hl2?.submitTxIq(iq)
                 g2?.submitTxIq(iq)
+                lastTxIqMs = android.os.SystemClock.elapsedRealtime()
             }
 
             // Multi-receiver
