@@ -10,13 +10,3 @@
 [submodule "app/src/main/java/com/isaklab/libg2sdrk"]
 	path = app/src/main/java/com/isaklab/libg2sdrk
 	url = ../libg2sdrk
-[submodule "proto"]
-	path = proto
-	url = ../isdr-proto
-# FLEX SUPPORT WITHDRAWN. libflexk went private, so a clone without access to
-# it must still build — an entry here would make `git submodule update` fail
-# for everyone else. Kept commented instead of deleted so turning support back
-# on is uncommenting this block plus the FLEX paths in DriverSession.kt.
-# [submodule "app/src/main/java/com/isaklab/libflexk"]
-# 	path = app/src/main/java/com/isaklab/libflexk
-# 	url = ../libflexk

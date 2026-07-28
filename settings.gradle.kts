@@ -27,4 +27,4 @@ rootProject.name = "isdr-drivers"
 include(":app")
 // Wire contract with the iSDR app (git submodule, dual-licensed).
 include(":proto")
-project(":proto").projectDir = file("proto")
+project(":proto").projectDir = file("../isdr-proto")
