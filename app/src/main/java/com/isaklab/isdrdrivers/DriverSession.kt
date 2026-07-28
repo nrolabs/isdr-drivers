@@ -22,6 +22,7 @@ import com.isaklab.isdrproto.Frame
 import com.isaklab.isdrproto.Frames
 import com.isaklab.isdrproto.DriverProto
 import com.isaklab.isdrproto.IqCodec
+import com.isaklab.isdrproto.SpectrumCodec
 import com.isaklab.isdrproto.RadioTelemetry
 import com.isaklab.isdrproto.getBool
 import com.isaklab.isdrproto.getFloats
@@ -359,30 +360,42 @@ class DriverSession(
     // Data callbacks of one client share a thread, so a plain int suffices.
     private var flushSeq = 0
 
-    /**
-     * Wire encoding for IQ payloads. Float32 until the host asks otherwise,
-     * so a host that predates FEAT_IQ_FORMAT is unaffected.
-     *
-     * Written from the command thread and read from the data thread; the
-     * worst a race can do is encode one block in the previous format, and
-     * every block carries its own length, so the reader stays in step.
-     */
-    @Volatile
-    private var iqFormat = DriverProto.IQ_FORMAT_F32
+
+
+    /** Last spectrum actually put on the wire; see [onData]. */
+    private var lastSentSpectrum: FloatArray? = null
 
     private fun onData(fft: FloatArray, iq: FloatArray) {
         val tag = flushSeq
         flushSeq = (flushSeq + 1) and 0x7fffffff
         if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq, tag)) return
-        // The spectrum stays float32: it is ~800 bins against hundreds of
-        // thousands of IQ samples, so narrowing it buys nothing measurable.
-        val fmt = iqFormat
-        val len = 12 + fft.size * 4 + IqCodec.encodedSize(fmt, iq.size)
+        // Ship the spectrum only when it is NEW.
+        //
+        // Every driver recomputes the FFT on a DISPLAY cadence (~12 fps) but
+        // hands the cached result back with every IQ block (~115/s), so about
+        // nine of every ten frames carried a byte-identical copy of the one
+        // before. Wideband that was lost against hundreds of thousands of IQ
+        // samples — the assumption this code used to state. Once the station
+        // channelises to the mode's window that inverts: at a 6 kHz SSB
+        // window the IQ is 96 kbit/s and the repeated spectrum is 2.9 Mbit/s,
+        // thirty times the payload it accompanies.
+        //
+        // Identity is exactly the right test: each computation publishes a
+        // fresh array, so an unchanged reference IS an unchanged spectrum.
+        // An empty spectrum is already a valid frame (drivers send one when
+        // nothing is displaying), so no peer has to learn anything new.
+        val fresh = fft.isNotEmpty() && fft !== lastSentSpectrum
+        if (fresh) lastSentSpectrum = fft
+        val outFft = if (fresh) fft else EMPTY_FLOATS
+
+        val fmt = DriverProto.IQ_WIRE_FORMAT
+        val sfmt = DriverProto.SPECTRUM_WIRE_FORMAT
+        val len = 12 + SpectrumCodec.encodedSize(sfmt, outFft.size) +
+            IqCodec.encodedSize(fmt, iq.size)
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
-        bb.putInt(fft.size)
-        bb.asFloatBuffer().put(fft)
-        bb.position(bb.position() + fft.size * 4)
+        bb.putInt(outFft.size)
+        bb.position(SpectrumCodec.encode(outFft, outFft.size, sfmt, b, bb.position()))
         bb.putInt(iq.size)
         bb.position(IqCodec.encode(iq, iq.size, fmt, b, bb.position()))
         bb.putInt(tag)
@@ -392,7 +405,7 @@ class DriverSession(
     private fun onDataRx(rx: Int, iq: FloatArray) {
         val tag = flushSeq                       // seq of the flush's EV_DATA
         if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq, tag)) return
-        val fmt = iqFormat
+        val fmt = DriverProto.IQ_WIRE_FORMAT
         val len = 12 + IqCodec.encodedSize(fmt, iq.size)
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
@@ -498,7 +511,6 @@ class DriverSession(
                 val version = p.int
                 val features = DriverProto.FEAT_RX_STREAMS or
                     DriverProto.FEAT_SEQ_TAG or
-                    DriverProto.FEAT_IQ_FORMAT or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -603,13 +615,6 @@ class DriverSession(
             }
 
             // Multi-receiver
-            DriverProto.CMD_SET_IQ_FORMAT -> p.int.let { f ->
-                // An unknown code means the host is newer than this driver;
-                // staying on float32 is correct and audible to nobody, whereas
-                // guessing would corrupt every block.
-                iqFormat = if (DriverProto.isKnownIqFormat(f)) f else DriverProto.IQ_FORMAT_F32
-                Log.i(TAG, "iq wire format -> $iqFormat")
-            }
 
             DriverProto.CMD_SET_RECEIVER_COUNT -> p.int.let { n ->
                 hl2?.setReceiverCount(n)
