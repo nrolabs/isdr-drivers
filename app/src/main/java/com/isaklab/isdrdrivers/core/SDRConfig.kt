@@ -3,6 +3,9 @@ package com.isaklab.isdrdrivers.core
 /**
  * Central defaults and shared constants for the SDR pipeline: frequency limits,
  * sample rates, demod bandwidth presets, FFT size and the audio output rate.
+ *
+ * Provides static configuration data to ensure consistency across the UI, 
+ * the DSP thread, and hardware drivers without redundant initialization.
  */
 object SDRConfig {
 

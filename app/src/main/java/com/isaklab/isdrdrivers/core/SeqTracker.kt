@@ -36,6 +36,9 @@ package com.isaklab.isdrdrivers.core
  * [gapEvents] counts discontinuity events (loss, reorder and restart alike)
  * and [lostPackets] the estimated packets missing — both are exported through
  * the host telemetry so the app can surface link quality.
+ * 
+ * Performs tracking without GC allocations, as allocations are forbidden on 
+ * the streaming path.
  */
 class SeqTracker(
     private val modulo: Long = 1L shl 32,

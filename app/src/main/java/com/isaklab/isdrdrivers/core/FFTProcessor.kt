@@ -16,6 +16,9 @@ import kotlin.math.*
  * ~10 % on screen, and short signals landing later in a block never appeared.
  * Same output size and call cadence as before; only the estimate improved
  * (variance drops ~1/segments).
+ * 
+ * Complies with the real-time constraints: GC allocations are forbidden on the 
+ * streaming path, and all computation relies on pre-allocated arrays.
  */
 class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
 

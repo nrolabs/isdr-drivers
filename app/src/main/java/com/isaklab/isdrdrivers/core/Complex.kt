@@ -1,5 +1,13 @@
 package com.isaklab.isdrdrivers.core
 
+/**
+ * Immutable representation of a complex number (real + imaginary)
+ * used for baseband DSP calculations.
+ *
+ * Note: To comply with real-time requirements, GC allocations are forbidden 
+ * on the streaming path. Do not instantiate these objects inside tight 
+ * processing loops (e.g., sample-by-sample processing).
+ */
 data class Complex(val real: Double, val imaginary: Double) {
 
     val magnitude: Double

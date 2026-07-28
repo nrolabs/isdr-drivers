@@ -52,6 +52,11 @@ import kotlinx.coroutines.launch
  * most one open radio; a second CMD_OPEN closes the previous one first. The
  * driver host is a pure transport — every command maps 1:1 onto a driver call, all
  * radio policy (gain scales, drive mapping, band logic) lives in the app.
+ *
+ * CRITICAL PERFORMANCE CONTRACT:
+ * - GC allocations are forbidden on the streaming path (IQ data RX/TX).
+ * - All hardware register access is serialized.
+ * - Enqueuing and buffering reuse memory through pooling.
  */
 class DriverSession(
     private val context: Context,

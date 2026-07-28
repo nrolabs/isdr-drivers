@@ -12,6 +12,10 @@ import java.util.concurrent.TimeUnit
  * the FFT on its own thread and publishes the result for the next delivery.
  *
  * Spectrum is inherently latest-wins: the queue holds one job, drop-oldest.
+ * 
+ * Maintains isolation from the streaming path, where GC allocations are forbidden,
+ * utilizing double-buffering pre-allocated arrays to guarantee zero-allocation
+ * handoffs. Register access is serialized elsewhere to avoid contentions.
  */
 class SpectrumWorker(private val fft: FFTProcessor) {
 

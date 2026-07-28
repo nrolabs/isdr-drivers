@@ -29,7 +29,8 @@ package com.isaklab.isdrdrivers.core
  * proxy for "the far end is gone".
  *
  * Kept as a pure decision so the rule can be tested without a radio, a
- * socket or a clock: the plumbing around it cannot be.
+ * socket or a clock: the plumbing around it cannot be. Register access triggered 
+ * by the watchdog timeout must still be safely serialized.
  */
 object TxWatchdogPolicy {
 

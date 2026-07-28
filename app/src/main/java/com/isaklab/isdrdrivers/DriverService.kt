@@ -36,6 +36,10 @@ import kotlin.concurrent.thread
  * TCP port [DriverProto.PORT]; each accepted connection becomes an independent
  * [DriverSession] that may open ONE radio. The service stops itself when the
  * last session closes.
+ *
+ * Hardware register access is strictly serialized within each session to 
+ * prevent device state corruption, and the shared-memory binder is utilized
+ * for zero-copy streaming.
  */
 class DriverService : Service() {
 

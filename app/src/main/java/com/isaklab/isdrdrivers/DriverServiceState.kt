@@ -24,6 +24,9 @@ import java.util.concurrent.CopyOnWriteArraySet
  * run on background threads while [DriverActivity] observes from the main
  * thread, so updates are marshalled through the main handler and the
  * snapshot is replaced atomically (never mutated).
+ *
+ * This state repository guarantees safe cross-thread visibility for the UI,
+ * decoupled from the real-time constraints of the SDR streaming path.
  */
 object DriverServiceState {
 

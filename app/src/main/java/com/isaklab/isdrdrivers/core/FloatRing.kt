@@ -24,6 +24,9 @@ package com.isaklab.isdrdrivers.core
  *
  * NOT thread-safe by itself — callers keep their existing `synchronized`
  * (txLock) discipline, exactly like the deque it replaces.
+ * 
+ * Implements strict zero-allocation buffering, because GC allocations are 
+ * forbidden on the streaming path.
  */
 class FloatRing(val capacity: Int) {
     private val buf = FloatArray(capacity)

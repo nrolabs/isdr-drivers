@@ -29,6 +29,9 @@ import androidx.core.content.ContextCompat
  * manual start/stop for troubleshooting. Normal users never need to open it —
  * the iSDR app starts the service on demand — but when something is wrong
  * this screen must answer "is it alive?" at a glance.
+ *
+ * This activity relies on the [DriverServiceState] to reflect real-time
+ * conditions without blocking the underlying DSP or driver threads.
  */
 class DriverActivity : AppCompatActivity() {
 

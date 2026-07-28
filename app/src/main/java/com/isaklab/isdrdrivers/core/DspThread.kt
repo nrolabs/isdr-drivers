@@ -24,6 +24,9 @@ import java.util.concurrent.locks.LockSupport
  * does not need a scheduler: it needs one thread of its own. That is all this
  * is — plus the pacing helper, so the cadence never goes back through the
  * coroutine timer.
+ * 
+ * CRITICAL: GC allocations are strictly forbidden on these threads to avoid 
+ * arbitrary latency spikes on the streaming path.
  */
 object DspThread {
 
