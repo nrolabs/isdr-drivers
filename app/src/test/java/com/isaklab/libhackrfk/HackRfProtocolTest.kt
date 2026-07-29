@@ -3,6 +3,7 @@ package com.isaklab.libhackrfk
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -199,9 +200,98 @@ class HackRfProtocolTest {
     @Test
     fun `tx bulk writes stay multiples of the 512-byte usb packet`() {
         // Firmware bulk endpoints use 512-byte max packets and the reference
-        // host pads TX to that boundary; our block is 512 pairs × 50 × 2.
-        val txBlockBytes = 512 * HackRfProtocol.TX_UPSAMPLE * 2
-        assertEquals(0, txBlockBytes % 512)
+        // host pads TX to that boundary (hackrf.c transfer callback). A short
+        // packet mid-stream would desynchronise the firmware's 16 KiB reads,
+        // so the block size must divide evenly.
+        assertEquals(
+            HackRfProtocol.TX_BLOCK_PAIRS * HackRfProtocol.TX_UPSAMPLE * 2,
+            HackRfProtocol.TX_BLOCK_BYTES,
+        )
+        assertEquals(0, HackRfProtocol.TX_BLOCK_BYTES % 512)
+    }
+
+    @Test
+    fun `firmware buffer sizes match the reference headers`() {
+        // usb_buffer.h: both halves are 0x8000; usb_api_transceiver.c reads
+        // bulk-OUT in 0x4000 blocks.
+        assertEquals(0x8000, HackRfProtocol.USB_SAMP_BUFFER_SIZE)
+        assertEquals(0x8000, HackRfProtocol.USB_BULK_BUFFER_SIZE)
+        assertEquals(0x4000, HackRfProtocol.USB_TRANSFER_SIZE)
+        assertEquals(0x10000, HackRfProtocol.DEVICE_TX_BUFFER_BYTES)
+    }
+
+    @Test
+    fun `the whole tx pipeline stays inside the board's buffer budget`() {
+        // The board holds DEVICE_TX_BUFFER_BYTES while transmitting — 13.65 ms
+        // at TX_BOARD_RATE. Every block the host renders must be comfortably
+        // smaller than that, or a single late block is already a shortfall.
+        val blockMs = HackRfProtocol.TX_BLOCK_BYTES / 2.0 /
+            HackRfProtocol.TX_BOARD_RATE * 1000.0
+        val boardMs = HackRfProtocol.DEVICE_TX_BUFFER_BYTES / 2.0 /
+            HackRfProtocol.TX_BOARD_RATE * 1000.0
+        assertTrue("block $blockMs ms vs board $boardMs ms", blockMs < boardMs / 2)
+    }
+
+    @Test
+    fun `tx cushion is a sane fraction of the ring and above the slack`() {
+        assertTrue(HackRfProtocol.TX_SLACK_PAIRS < HackRfProtocol.TX_TARGET_PAIRS)
+        // The correction must never be able to empty the queue in one block.
+        assertTrue(
+            HackRfProtocol.TX_TARGET_PAIRS - HackRfProtocol.TX_SLACK_PAIRS >
+                HackRfProtocol.TX_BLOCK_PAIRS,
+        )
+        // 30 ms cushion at the 48 kSps input rate.
+        assertEquals(30, HackRfProtocol.TX_TARGET_PAIRS * 1000 / HackRfProtocol.TX_INPUT_RATE)
+    }
+
+    // ---- M0 SGPIO loop state (hackrf.c hackrf_get_m0_state) ------------------
+
+    @Test
+    fun `m0 state request id matches the reference enum`() {
+        assertEquals(41, HackRfProtocol.REQ_GET_M0_STATE)
+        assertEquals(40, HackRfProtocol.M0_STATE_SIZE)
+    }
+
+    @Test
+    fun `m0 state decodes the little-endian struct field by field`() {
+        // hackrf.h: u16 requested_mode, u16 request_flag, then 9 × u32.
+        val buf = ByteArray(HackRfProtocol.M0_STATE_SIZE)
+        fun putShort(off: Int, v: Int) {
+            buf[off] = (v and 0xFF).toByte()
+            buf[off + 1] = ((v ushr 8) and 0xFF).toByte()
+        }
+        fun putInt(off: Int, v: Int) {
+            buf[off] = (v and 0xFF).toByte()
+            buf[off + 1] = ((v ushr 8) and 0xFF).toByte()
+            buf[off + 2] = ((v ushr 16) and 0xFF).toByte()
+            buf[off + 3] = ((v ushr 24) and 0xFF).toByte()
+        }
+        putShort(0, 4)              // requested_mode = TX_RUN
+        putShort(2, 0)              // request_flag = completed
+        putInt(4, 4)                // active_mode
+        putInt(8, 0x11223344)       // m0_count
+        putInt(12, 0x55667788)      // m4_count
+        putInt(16, 7)               // num_shortfalls
+        putInt(20, 1024)            // longest_shortfall
+        putInt(24, 0)               // shortfall_limit
+        putInt(28, 0)               // threshold
+        putInt(32, 0)               // next_mode
+        putInt(36, 2)               // error = TX_TIMEOUT
+
+        val s = HackRfProtocol.parseM0State(buf)!!
+        assertEquals(4, s.requestedMode)
+        assertEquals(0, s.requestFlag)
+        assertEquals(4, s.activeMode)
+        assertEquals(0x11223344, s.m0Count)
+        assertEquals(0x55667788, s.m4Count)
+        assertEquals(7, s.numShortfalls)
+        assertEquals(1024, s.longestShortfall)
+        assertEquals(2, s.error)
+    }
+
+    @Test
+    fun `m0 state rejects a short reply instead of decoding garbage`() {
+        assertNull(HackRfProtocol.parseM0State(ByteArray(HackRfProtocol.M0_STATE_SIZE - 1)))
     }
 
     // ---- sweep mode (usb_api_sweep.c) ----------------------------------------

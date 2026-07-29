@@ -639,7 +639,7 @@ class DriverSession(
 
             // TX
             DriverProto.CMD_SET_TX_FREQUENCY -> p.long.let { hz ->
-                hackRf?.setFrequency(hz)
+                hackRf?.setTxFrequency(hz)
                 hl2?.setTxFrequency(hz)
                 g2?.setTxFrequency(hz)
             }
