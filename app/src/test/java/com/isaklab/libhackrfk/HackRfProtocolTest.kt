@@ -83,16 +83,64 @@ class HackRfProtocolTest {
         assertEquals(28_000_000, HackRfProtocol.basebandFilterFor(40_000_000))
     }
 
+    /**
+     * The round-down-strictly-below variant, which is the one the reference's
+     * own capture tools use: it steps down a rung even on an exact hit, so the
+     * filter corner never lands on the edge of the band it protects.
+     */
+    @Test
+    fun `strict round down steps below an exact table entry`() {
+        assertEquals(3_500_000, HackRfProtocol.basebandFilterRoundDownLt(5_000_000))
+        assertEquals(3_500_000, HackRfProtocol.basebandFilterRoundDownLt(4_200_000))
+        assertEquals(1_750_000, HackRfProtocol.basebandFilterRoundDownLt(1_000_000))
+        assertEquals(28_000_000, HackRfProtocol.basebandFilterRoundDownLt(40_000_000))
+    }
+
     @Test
     fun `auto filter for a sample rate uses 75 percent of the rate`() {
-        // 0.75 × 20 MHz = 15 MHz → exact table entry.
-        assertEquals(15_000_000, HackRfProtocol.basebandFilterForSampleRate(20_000_000))
+        // 0.75 × 20 MHz = 15 MHz, an exact entry → steps down to 14 MHz.
+        assertEquals(14_000_000, HackRfProtocol.basebandFilterForSampleRate(20_000_000))
         // 0.75 × 2 MHz = 1.5 MHz → below smallest → 1.75 MHz.
         assertEquals(1_750_000, HackRfProtocol.basebandFilterForSampleRate(2_000_000))
-        // 0.75 × 8 MHz = 6 MHz → exact entry.
-        assertEquals(6_000_000, HackRfProtocol.basebandFilterForSampleRate(8_000_000))
+        // 0.75 × 8 MHz = 6 MHz, an exact entry → steps down to 5.5 MHz.
+        assertEquals(5_500_000, HackRfProtocol.basebandFilterForSampleRate(8_000_000))
         // 0.75 × 10 MHz = 7.5 MHz → rounds down to 7 MHz.
         assertEquals(7_000_000, HackRfProtocol.basebandFilterForSampleRate(10_000_000))
+    }
+
+    // ---- automatic sample-rate divider (hackrf_set_sample_rate) -------------
+
+    @Test
+    fun `integer rates need no divider`() {
+        assertEquals(Pair(8_000_000, 1), HackRfProtocol.sampleRateAuto(8_000_000.0))
+        assertEquals(Pair(2_000_000, 1), HackRfProtocol.sampleRateAuto(2_000_000.0))
+        assertEquals(Pair(20_000_000, 1), HackRfProtocol.sampleRateAuto(20_000_000.0))
+    }
+
+    /**
+     * A rate the synthesiser cannot hit directly must come back as a PAIR.
+     * With the divider pinned at 1 the board silently ran at a rounded rate
+     * while the host still believed the requested one — every frequency
+     * derived from the sample rate was then wrong by that ratio.
+     */
+    @Test
+    fun `fractional rates come back as a frequency and divider pair`() {
+        val (hz, div) = HackRfProtocol.sampleRateAuto(2_500_000.5)
+        assertTrue("divider should not be pinned at 1", div > 1)
+        // The pair must still describe the requested rate.
+        assertEquals(2_500_000.5, hz.toDouble() / div, 0.5)
+    }
+
+    @Test
+    fun `the divider always reproduces the requested rate`() {
+        for (rate in listOf(
+            1_000_000.0, 2_000_000.0, 4_000_000.0, 8_000_000.0, 10_000_000.0,
+            12_500_000.0, 16_000_000.0, 20_000_000.0, 2_400_000.0, 3_200_000.0,
+        )) {
+            val (hz, div) = HackRfProtocol.sampleRateAuto(rate)
+            assertTrue("divider must be positive for $rate", div >= 1)
+            assertEquals("rate $rate", rate, hz.toDouble() / div, 1.0)
+        }
     }
 
     @Test

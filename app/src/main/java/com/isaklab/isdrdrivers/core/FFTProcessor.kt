@@ -39,6 +39,19 @@ class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
     private var dcQ = 0.0
     private val dcAlpha = 0.01
 
+    /**
+     * The DC estimate starts UNSET, not at zero.
+     *
+     * Ramping up from zero at 1 % a segment takes hundreds of segments to
+     * reach a real offset, and everything not yet subtracted lands in the
+     * centre bin: on a direct-conversion front end, whose offset is large by
+     * construction, that is a spike taller than any signal for the first
+     * seconds — and it came back every time this processor was rebuilt. The
+     * first segment's mean IS the offset, so it is adopted outright and the
+     * slow filter only tracks drift from there.
+     */
+    private var dcSeeded = false
+
     private val fftInput = DoubleArray(fftSize * 2)
     private val powerAcc = DoubleArray(fftSize)
 
@@ -101,8 +114,16 @@ class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
             sumI += iq[2 * (off + i)]
             sumQ += iq[2 * (off + i) + 1]
         }
-        dcI = dcI * (1 - dcAlpha) + (sumI / size) * dcAlpha
-        dcQ = dcQ * (1 - dcAlpha) + (sumQ / size) * dcAlpha
+        val meanI = sumI / size
+        val meanQ = sumQ / size
+        if (!dcSeeded) {
+            dcI = meanI
+            dcQ = meanQ
+            dcSeeded = true
+        } else {
+            dcI = dcI * (1 - dcAlpha) + meanI * dcAlpha
+            dcQ = dcQ * (1 - dcAlpha) + meanQ * dcAlpha
+        }
 
         java.util.Arrays.fill(fftInput, 0.0)
         for (i in 0 until size) {
@@ -132,6 +153,7 @@ class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
         previousSpectrum = null
         dcI = 0.0
         dcQ = 0.0
+        dcSeeded = false
     }
 
     fun resetSmoothing() {

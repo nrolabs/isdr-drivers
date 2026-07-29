@@ -18,6 +18,11 @@ package com.isaklab.isdrdrivers
 import android.content.Context
 import android.util.Log
 import com.isaklab.isdrdrivers.core.DspThread
+import com.isaklab.isdrdrivers.core.RadioClient
+import com.isaklab.isdrdrivers.core.AntennaPowerCapable
+import com.isaklab.isdrdrivers.core.AnalogFilterCapable
+import com.isaklab.isdrdrivers.core.TransmitCapable
+import com.isaklab.isdrdrivers.core.TxDriveCapable
 import com.isaklab.isdrproto.Frame
 import com.isaklab.isdrproto.Frames
 import com.isaklab.isdrproto.DriverProto
@@ -35,6 +40,7 @@ import com.isaklab.libhl2sdrk.Hl2Protocol
 import com.isaklab.librtlsdrk.RTLCommand
 import com.isaklab.librtlsdrk.RTLTCPClient
 import com.isaklab.librtlsdrk.RTLUSBClient
+import java.nio.ByteBuffer
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -96,6 +102,13 @@ class DriverSession(
     // app could open the radio and key TX otherwise). A missing token means
     // misconfiguration, so it fails closed (never authenticated).
     @Volatile private var authenticated = false
+
+    /**
+     * The open radio, seen through the contract every library implements.
+     * The typed fields below still exist for the commands that are genuinely
+     * specific to one radio; everything common goes through this one.
+     */
+    @Volatile private var radio: RadioClient? = null
 
     private val frames = Frames(
         DataInputStream(BufferedInputStream(socket.getInputStream(), 64 * 1024)),
@@ -495,6 +508,106 @@ class DriverSession(
     private fun sendTelemetry(t: RadioTelemetry) =
         enqueue(OutEntry(0, null, 0, { frames.writeTelemetry(t) }, droppable = true))
 
+    // ---- HackRF queries -----------------------------------------------------
+    //
+    // These are REPLIES, not telemetry: never droppable, because a query the
+    // app is waiting on that gets silently discarded by backpressure leaves
+    // the device panel blank with no error to explain it.
+
+    /** Append a u16-length-prefixed UTF-8 string, matching ByteBuffer.getUtf. */
+    private fun ByteBuffer.putUtf(s: String): ByteBuffer {
+        val utf = s.toByteArray(Charsets.UTF_8)
+        putShort(utf.size.toShort())
+        put(utf)
+        return this
+    }
+
+    /**
+     * Runs OFF the session thread: it issues several control transfers in
+     * series, and on a board that has stopped answering each one costs its
+     * full timeout — seconds during which PTT would sit in the queue behind
+     * a status query.
+     */
+    private fun sendHackRfInfo() {
+        val hrf = hackRf ?: return
+        scope.launch { sendHackRfInfoBlocking(hrf) }
+    }
+
+    private fun sendHackRfInfoBlocking(hrf: HackRfClient) {
+        val info = hrf.boardInfo()
+        val boards = hrf.operacakeBoards()
+        val clkin = hrf.clkinStatus()
+        val cpld = hrf.cpldChecksum()
+        val strings = listOf(
+            info.boardName, info.revisionName, info.platformName,
+            info.firmwareVersion, info.usbApiName, info.serialNumber,
+        )
+        val cap = 4 + 4 + 1 + 4 + 4 + 1 + 4 + boards.size * 4 + 8 + 1 + 4 + 1 + 4 + 4 +
+            strings.sumOf { 2 + it.toByteArray(Charsets.UTF_8).size }
+        val bb = ByteBuffer.allocate(cap)
+        bb.putInt(info.boardId)
+        bb.putUtf(info.boardName)
+        bb.putInt(info.boardRevision)
+        bb.putUtf(info.revisionName)
+        bb.put(if (info.isGenuineGsg) 1 else 0)
+        bb.putInt(info.platformBits)
+        bb.putUtf(info.platformName)
+        bb.putUtf(info.firmwareVersion)
+        bb.putInt(info.usbApiVersion)
+        bb.putUtf(info.usbApiName)
+        bb.putUtf(info.serialNumber)
+        bb.put(if (clkin) 1 else 0)
+        bb.putInt(boards.size)
+        boards.forEach { bb.putInt(it) }
+        bb.putLong(cpld)
+        bb.put(if (info.revisionKnown) 1 else 0)
+        bb.putInt(hrf.basebandFilterHz())
+        bb.put(if (hrf.hasExplicitTuning()) 1 else 0)
+        bb.putInt(boards.firstOrNull()?.let { hrf.operacakeGetMode(it) } ?: -1)
+        bb.putInt(hrf.supportedControls())
+        bb.flip()
+        send { frames.write(DriverProto.EV_HRF_INFO, bb) }
+    }
+
+    private fun sendHackRfM0State() {
+        val st = hackRf?.m0State() ?: return
+        val bb = ByteBuffer.allocate(11 * 4)
+        bb.putInt(st.requestedMode)
+        bb.putInt(st.requestFlag)
+        bb.putInt(st.activeMode)
+        bb.putInt(st.m0Count)
+        bb.putInt(st.m4Count)
+        bb.putInt(st.numShortfalls)
+        bb.putInt(st.longestShortfall)
+        bb.putInt(st.shortfallLimit)
+        bb.putInt(st.threshold)
+        bb.putInt(st.nextMode)
+        bb.putInt(st.error)
+        bb.flip()
+        send { frames.write(DriverProto.EV_HRF_M0_STATE, bb) }
+    }
+
+    /**
+     * Self-test runs OFF the session thread: the RTC oscillator check alone
+     * sleeps a full second by design, and doing that inline would stall every
+     * command queued behind it — including PTT.
+     */
+    private fun sendHackRfSelfTest() {
+        val hrf = hackRf ?: return
+        scope.launch {
+            val test = hrf.readSelfTest()
+            val rtc = hrf.testRtcOsc()
+            val msg = test?.message ?: ""
+            val bb = ByteBuffer.allocate(1 + 2 + msg.toByteArray(Charsets.UTF_8).size + 2)
+            bb.put(if (test?.pass == true) 1 else 0)
+            bb.putUtf(msg)
+            bb.put(if (rtc != null) 1 else 0)
+            bb.put(if (rtc == true) 1 else 0)
+            bb.flip()
+            send { frames.write(DriverProto.EV_HRF_SELFTEST, bb) }
+        }
+    }
+
     private fun onHl2Telemetry(t: Hl2Protocol.Telemetry) = sendTelemetry(
         RadioTelemetry(
             temperatureC = t.temperatureC, paCurrentA = t.paCurrentA,
@@ -563,6 +676,10 @@ class DriverSession(
                 val version = p.int
                 val features = DriverProto.FEAT_RX_STREAMS or
                     DriverProto.FEAT_SEQ_TAG or
+                    DriverProto.FEAT_RF_PATH_CONTROL or
+                    DriverProto.FEAT_ANTENNA_SWITCH or
+                    DriverProto.FEAT_CLOCK_TRIGGER or
+                    DriverProto.FEAT_BOARD_DIAGNOSTICS or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -613,41 +730,27 @@ class DriverSession(
                 Log.i(TAG, "shm data plane ${if (shmArmed) "armed" else "off"}")
             }
 
-            DriverProto.CMD_SET_FREQUENCY -> p.long.let { hz ->
-                // flex?.setFrequency(hz)
-                rtlTcp?.setFrequency(hz)
-                rtlUsb?.sendCommand(RTLCommand.SetFrequency(hz))
-                hackRf?.setFrequency(hz)
-                hl2?.setFrequency(hz)
-                g2?.setFrequency(hz)
-            }
-            DriverProto.CMD_SET_SAMPLE_RATE -> p.int.let { hz ->
-                // flex?.setSampleRate(hz)
-                rtlTcp?.setSampleRate(hz)
-                rtlUsb?.sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
-                hackRf?.setSampleRate(hz)
-                hl2?.setSampleRate(hz)
-                g2?.setSampleRate(hz)
-            }
+            // The common set goes through the contract, not through one line
+            // per radio. A radio added later is reached here the moment it is
+            // constructed, with nothing to remember to extend.
+            DriverProto.CMD_SET_FREQUENCY -> radio?.setFrequency(p.long)
+            DriverProto.CMD_SET_SAMPLE_RATE -> radio?.setSampleRate(p.int)
             DriverProto.CMD_SET_SPECTRUM_INTEREST -> p.getBool().let { on ->
-                rtlTcp?.spectrumEnabled = on
-                rtlUsb?.spectrumEnabled = on
-                hackRf?.spectrumEnabled = on
-                hl2?.spectrumEnabled = on
-                g2?.spectrumEnabled = on
+                radio?.spectrumEnabled = on
+            }
+            DriverProto.CMD_SET_ANTENNA_POWER -> p.getBool().let { on ->
+                (radio as? AntennaPowerCapable)?.setAntennaPower(on)
+            }
+            DriverProto.CMD_SET_ANALOG_FILTER -> p.int.let { hz ->
+                (radio as? AnalogFilterCapable)?.setAnalogFilterHz(hz)
             }
 
             // TX
             DriverProto.CMD_SET_TX_FREQUENCY -> p.long.let { hz ->
-                hackRf?.setTxFrequency(hz)
-                hl2?.setTxFrequency(hz)
-                g2?.setTxFrequency(hz)
+                (radio as? TransmitCapable)?.setTxFrequency(hz)
             }
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
-                // flex?.setPtt(on)
-                hackRf?.setPtt(on)
-                hl2?.setPtt(on)
-                g2?.setPtt(on)
+                (radio as? TransmitCapable)?.setPtt(on)
                 pttOn = on
                 // Cleared either way: the watchdog re-arms only when transmit
                 // samples actually start flowing, so a mode that keys without
@@ -656,16 +759,12 @@ class DriverSession(
                 sendTxState()
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
-                // flex?.setTxDrive(level)
-                hl2?.setTxDrive(level)
-                g2?.setTxDrive(level)
+                (radio as? TxDriveCapable)?.setTxDrive(level)
             }
             DriverProto.CMD_SET_PA_ENABLED -> p.getBool().let { on ->
-                hl2?.setPaEnabled(on)
-                g2?.setPaEnabled(on)
+                (radio as? TxDriveCapable)?.setPaEnabled(on)
             }
             DriverProto.CMD_TX_IQ -> p.getFloats().let { iq ->
-                // flex?.submitTxIq(iq)
                 hackRf?.submitTxIq(iq)
                 hl2?.submitTxIq(iq)
                 g2?.submitTxIq(iq)
@@ -738,7 +837,6 @@ class DriverSession(
             DriverProto.CMD_HRF_SET_VGA -> hackRf?.setVgaGain(p.int)
             DriverProto.CMD_HRF_SET_TXVGA -> hackRf?.setTxVgaGain(p.int)
             DriverProto.CMD_HRF_SET_AMP -> hackRf?.setAmpEnable(p.getBool())
-            DriverProto.CMD_HRF_SET_ANTENNA_POWER -> hackRf?.setAntennaPower(p.getBool())
             DriverProto.CMD_HRF_START_RX -> hackRf?.startRx()
             DriverProto.CMD_HRF_SWEEP_START -> {
                 val startMHz = p.int
@@ -748,6 +846,68 @@ class DriverSession(
                 hackRf?.startSweep(startMHz, stopMHz, rateHz, stepHz, ::onSweepBlock)
             }
             DriverProto.CMD_HRF_SWEEP_STOP -> hackRf?.stopSweep()
+
+            // HackRF, second block: the rest of what the board can be told.
+            DriverProto.CMD_HRF_SET_FREQ_EXPLICIT -> {
+                val ifHz = p.long
+                val loHz = p.long
+                val path = p.int
+                hackRf?.setFreqExplicit(ifHz, loHz, path)
+            }
+            DriverProto.CMD_HRF_SET_BIAS_T_OPTS -> {
+                // Decoded into plain wire values and handed over as such. The
+                // host has no business building a lib's own data class: that
+                // makes an internal type of one radio part of the dispatch.
+                val offUpdate = p.getBool(); val offOnEntry = p.getBool()
+                val offEnabled = p.getBool()
+                val rxUpdate = p.getBool(); val rxOnEntry = p.getBool()
+                val rxEnabled = p.getBool()
+                val txUpdate = p.getBool(); val txOnEntry = p.getBool()
+                val txEnabled = p.getBool()
+                hackRf?.setBiasTeeOptions(
+                    offUpdate, offOnEntry, offEnabled,
+                    rxUpdate, rxOnEntry, rxEnabled,
+                    txUpdate, txOnEntry, txEnabled,
+                )
+            }
+            DriverProto.CMD_HRF_SET_HW_SYNC -> hackRf?.setHwSyncMode(p.getBool())
+            DriverProto.CMD_HRF_SET_UI_ENABLE -> hackRf?.setUiEnable(p.getBool())
+            DriverProto.CMD_HRF_SET_LEDS -> hackRf?.setLeds(p.int)
+            DriverProto.CMD_HRF_SET_NARROWBAND_FILTER ->
+                hackRf?.setNarrowbandFilter(p.getBool())
+            DriverProto.CMD_HRF_SET_CLKOUT -> hackRf?.setClkoutEnable(p.getBool())
+            DriverProto.CMD_HRF_SET_CLKIN_CTRL -> hackRf?.setClkinCtrl(p.int)
+            DriverProto.CMD_HRF_SET_P1_CTRL -> hackRf?.setP1Ctrl(p.int)
+            DriverProto.CMD_HRF_SET_P2_CTRL -> hackRf?.setP2Ctrl(p.int)
+            DriverProto.CMD_HRF_SET_TX_UNDERRUN_LIMIT -> hackRf?.setTxUnderrunLimit(p.int)
+            DriverProto.CMD_HRF_SET_RX_OVERRUN_LIMIT -> hackRf?.setRxOverrunLimit(p.int)
+            DriverProto.CMD_HRF_OPERACAKE_SET_PORTS -> {
+                val addr = p.int
+                val portA = p.int
+                val portB = p.int
+                hackRf?.operacakeSetPorts(addr, portA, portB)
+            }
+            DriverProto.CMD_HRF_OPERACAKE_SET_MODE -> {
+                val addr = p.int
+                hackRf?.operacakeSetMode(addr, p.int)
+            }
+            DriverProto.CMD_HRF_OPERACAKE_SET_RANGES -> {
+                val n = p.int
+                val ranges = ArrayList<Triple<Int, Int, Int>>(n.coerceIn(0, 8))
+                repeat(n.coerceIn(0, 8)) { ranges.add(Triple(p.int, p.int, p.int)) }
+                if (ranges.isNotEmpty()) hackRf?.operacakeSetFreqRanges(ranges)
+            }
+            DriverProto.CMD_HRF_OPERACAKE_SET_DWELL -> {
+                val n = p.int
+                val dwells = ArrayList<Pair<Int, Int>>(n.coerceIn(0, 16))
+                repeat(n.coerceIn(0, 16)) { dwells.add(Pair(p.int, p.int)) }
+                if (dwells.isNotEmpty()) hackRf?.operacakeSetDwellTimes(dwells)
+            }
+            DriverProto.CMD_HRF_RESET -> hackRf?.reset()
+            DriverProto.CMD_HRF_QUERY_INFO -> sendHackRfInfo()
+            DriverProto.CMD_HRF_QUERY_M0_STATE -> sendHackRfM0State()
+            DriverProto.CMD_HRF_SELFTEST -> sendHackRfSelfTest()
+            DriverProto.CMD_HRF_CLEAR_FREQ_EXPLICIT -> hackRf?.clearFreqExplicit()
 
             // RTL tuner
             DriverProto.CMD_RTL_SET_GAIN -> p.int.let { g ->
@@ -766,16 +926,12 @@ class DriverSession(
                 rtlTcp?.setFrequencyCorrection(ppm)
                 rtlUsb?.sendCommand(RTLCommand.SetPPMCorrection(ppm))
             }
-            DriverProto.CMD_RTL_SET_BIAS_TEE -> p.getBool().let { on ->
-                rtlTcp?.setBiasTee(on)
-                rtlUsb?.sendCommand(RTLCommand.SetBiasTee(on))
-            }
+
             DriverProto.CMD_RTL_SET_DIRECT_SAMPLING -> p.int.let { mode ->
                 rtlUsb?.setDirectSamplingMode(mode)
                 rtlTcp?.setDirectSampling(mode)
             }
             // rtl_tcp has no bandwidth opcode; USB only.
-            DriverProto.CMD_RTL_SET_TUNER_BANDWIDTH -> rtlUsb?.setTunerBandwidth(p.int)
 
             else -> Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)}")
         }
@@ -794,16 +950,19 @@ class DriverSession(
                 DriverProto.DEV_RTL_TCP -> {
                     val c = RTLTCPClient(host, port, ::onData, onStatusGen)
                     rtlTcp = c
+                    radio = c
                     c.connect()
                 }
                 DriverProto.DEV_RTL_USB -> {
                     val c = RTLUSBClient(context, ::onData, onStatusGen)
                     rtlUsb = c
+                    radio = c
                     c.connect()
                 }
                 DriverProto.DEV_HACKRF -> {
                     val c = HackRfClient(context, ::onData, onStatusGen)
                     hackRf = c
+                    radio = c
                     c.connect()
                 }
                 DriverProto.DEV_FLEX -> {
@@ -837,6 +996,7 @@ class DriverSession(
                         classicBoard = flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0,
                     )
                     hl2 = c
+                    radio = c
                     c.connect()
                 }
                 DriverProto.DEV_G2 -> {
@@ -848,6 +1008,7 @@ class DriverSession(
                         onDataRx = ::onDataRx,
                     )
                     g2 = c
+                    radio = c
                     c.connect()
                 }
                 else -> false
@@ -876,28 +1037,20 @@ class DriverSession(
         // Invalidate the outgoing clients' callbacks FIRST: their disconnect
         // paths are asynchronous and must not speak for the next client.
         clientGen.incrementAndGet()
-        val hadClient = rtlTcp != null || rtlUsb != null || hackRf != null ||
-            hl2 != null || g2 != null
+        val hadClient = radio != null
         try {
-            hl2?.setPtt(false)
-            g2?.setPtt(false)
-            hackRf?.setPtt(false)
-            // flex?.setPtt(false)
+            // Never leave the air keyed behind a closing session.
+            (radio as? TransmitCapable)?.setPtt(false)
         } catch (_: Exception) {
         }
         try {
-            rtlTcp?.disconnect()
-            rtlUsb?.disconnect()
-            hackRf?.disconnect()
-            hl2?.disconnect()
-            g2?.disconnect()
-            // flex?.disconnect()
+            radio?.disconnect()
         } catch (_: Exception) {
         }
+        radio = null
         rtlTcp = null
         rtlUsb = null
         hackRf = null
-        // flex = null
         hl2 = null
         g2 = null
         DriverServiceState.update {
