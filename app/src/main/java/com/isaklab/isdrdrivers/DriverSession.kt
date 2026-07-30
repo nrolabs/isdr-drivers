@@ -23,6 +23,7 @@ import com.isaklab.isdrdrivers.core.AntennaPowerCapable
 import com.isaklab.isdrdrivers.core.AnalogFilterCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrdrivers.core.TxDriveCapable
+import com.isaklab.isdrdrivers.core.TxTimingCapable
 import com.isaklab.isdrproto.Frame
 import com.isaklab.isdrproto.Frames
 import com.isaklab.isdrproto.DriverProto
@@ -643,6 +644,16 @@ class DriverSession(
         )
     )
 
+    // The HackRF has no periodic status packet like the HL2/G2, so its gap
+    // count arrives from the client's RX processing thread, only when it
+    // changes — same telemetry field, same meaning: samples the stream lost.
+    private fun onHackRfGaps(gaps: Long) = sendTelemetry(
+        RadioTelemetry(
+            rxGaps = gaps, linkDrops = outDrops,
+            hasRxGaps = true, hasLinkDrops = true,
+        )
+    )
+
     // Only the FLEX client fed this, so it is commented out with the rest of
     // the FLEX path — an unused private function is a compiler warning, and
     // this repo treats warnings as a gate.
@@ -763,6 +774,14 @@ class DriverSession(
             }
             DriverProto.CMD_SET_PA_ENABLED -> p.getBool().let { on ->
                 (radio as? TxDriveCapable)?.setPaEnabled(on)
+            }
+            DriverProto.CMD_SET_TX_TIMING -> {
+                val latencyMs = p.int
+                val hangMs = p.int
+                // Concept-level routing: any radio with a host-visible TX
+                // buffer implements TxTimingCapable and clamps to its own
+                // register range; the rest ignore the command.
+                (radio as? TxTimingCapable)?.setTxTiming(latencyMs, hangMs)
             }
             DriverProto.CMD_TX_IQ -> p.getFloats().let { iq ->
                 hackRf?.submitTxIq(iq)
@@ -960,7 +979,7 @@ class DriverSession(
                     c.connect()
                 }
                 DriverProto.DEV_HACKRF -> {
-                    val c = HackRfClient(context, ::onData, onStatusGen)
+                    val c = HackRfClient(context, ::onData, onStatusGen, ::onHackRfGaps)
                     hackRf = c
                     radio = c
                     c.connect()

@@ -251,6 +251,34 @@ class Hl2ProtocolTest {
     }
 
     @Test
+    fun controlFrame_addr17DefaultsSizedForNetworkJitter() {
+        // Defaults must be 70 ms latency / 30 hang: the gateware's own 10 ms
+        // buffer underruns on the first late packet over Wi-Fi/cellular and
+        // drops the opening syllable of every transmission.
+        val f = Hl2Protocol.buildControlFrame(0, 0x16, Hl2Protocol.ControlState(), null)
+        assertEquals(30, f[526].toInt() and 0x1F)   // C3 = PTT hang
+        assertEquals(70, f[527].toInt() and 0x7F)   // C4 = TX latency ms
+    }
+
+    @Test
+    fun controlState_txTimingSaturatesToRegisterRange() {
+        // Out-of-range requests saturate instead of wrapping: 500 masked to
+        // 7 bits would be 116, but 200 would wrap to 72 and 128 to 0 ms —
+        // a silent return to the syllable-dropping buffer.
+        val st = Hl2Protocol.ControlState()
+        st.txLatencyMs = 500; st.pttHang = 99
+        assertEquals(127, st.txLatencyMs)
+        assertEquals(31, st.pttHang)
+        st.txLatencyMs = -5; st.pttHang = -1
+        assertEquals(0, st.txLatencyMs)
+        assertEquals(0, st.pttHang)
+        st.txLatencyMs = 70; st.pttHang = 30
+        val f = Hl2Protocol.buildControlFrame(0, 0x16, st, null)
+        assertEquals(30, f[526].toInt() and 0xFF)
+        assertEquals(70, f[527].toInt() and 0xFF)
+    }
+
+    @Test
     fun controlFrame_addr3ACarriesResetOnDisconnect() {
         val on = Hl2Protocol.buildControlFrame(0, 0x3A, Hl2Protocol.ControlState(), null)
         assertEquals(0x3A, (on[11].toInt() and 0xFF) shr 1)

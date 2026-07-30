@@ -115,6 +115,18 @@ interface AnalogFilterCapable {
 }
 
 /**
+ * Radios whose transmit buffer timing is host-controlled.
+ *
+ * [latencyMs] is how much TX audio the radio buffers before RF starts — the
+ * slack that absorbs network jitter on the host→board stream. [hangMs] keeps
+ * the transmitter keyed after the audio stops so short gaps do not bounce the
+ * T/R relay. Each radio clamps both to its own register range.
+ */
+interface TxTimingCapable {
+    fun setTxTiming(latencyMs: Int, hangMs: Int)
+}
+
+/**
  * Radios with a gain stage AHEAD of the mixer, in dB.
  *
  * This is the stage that sets the noise figure, which is why it is worth
