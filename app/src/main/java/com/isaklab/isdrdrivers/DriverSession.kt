@@ -849,6 +849,12 @@ class DriverSession(
                 hl2?.setOpenCollectorOutputs(rx, tx)
             }
             DriverProto.CMD_HL2_SET_VNA_COUNT -> hl2?.setVnaCount(p.int)
+            DriverProto.CMD_HL2_SET_IOBOARD -> {
+                val enabled = p.getBool()
+                val rfInput = p.int
+                val opMode = p.int
+                hl2?.setIoBoard(enabled, rfInput, opMode)
+            }
             // PureSignal: shared opcode across HPSDR radios — the HL2 flips
             // the gateware routing bit, the G2 switches the reference DDC's
             // input to the TX/DUC loopback (P2 DDC-specific packet).
