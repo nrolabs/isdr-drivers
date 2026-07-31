@@ -88,6 +88,15 @@ class DriverSession(
 
         private val EMPTY_FLOATS = FloatArray(0)
 
+        /**
+         * Which session owns which radio (key = kind/host:port). The service
+         * allows several sessions, but a BOARD tolerates exactly one driver:
+         * two sessions on one HL2 interleave TX sequences and the stale one
+         * keeps asserting its MOX.
+         */
+        private val deviceOwners =
+            java.util.concurrent.ConcurrentHashMap<String, DriverSession>()
+
         /** Constant-time equality — never leak the token by comparison timing. */
         private fun tokensMatch(a: String, b: String): Boolean {
             val ab = a.toByteArray(Charsets.UTF_8)
@@ -402,6 +411,9 @@ class DriverSession(
     @Volatile private var pttOn = false
     @Volatile private var lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
 
+    /** Monotonic instant of the last key-down (for the no-stream ceilings). */
+    @Volatile private var keyedAtMs = 0L
+
     private fun startTxWatchdog() {
         scope.launch {
             while (!closed) {
@@ -409,17 +421,23 @@ class DriverSession(
                 val last = lastTxIqMs
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (!com.isaklab.isdrdrivers.core.TxWatchdogPolicy
-                        .shouldUnkey(pttOn, last, now)
+                        .shouldUnkey(pttOn, keyedAtMs, last, now)
                 ) {
                     continue
                 }
-                Log.w(TAG, "transmit watchdog: no IQ for ${now - last} ms while keyed — unkeying")
+                Log.w(
+                    TAG,
+                    "transmit watchdog: keyed ${now - keyedAtMs} ms, last IQ " +
+                        "${if (last == 0L) "never" else "${now - last} ms ago"} — unkeying",
+                )
                 pttOn = false
                 lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
                 try {
-                    hackRf?.setPtt(false)
-                    hl2?.setPtt(false)
-                    g2?.setPtt(false)
+                    // Through the capability, not per-radio fields: every
+                    // transmit-capable radio — current and future — gets the
+                    // same watchdog unkey, or a new driver would ship with a
+                    // silent hole in the safety net.
+                    (radio as? TransmitCapable)?.setPtt(false)
                 } catch (e: Exception) {
                     Log.e(TAG, "watchdog could not unkey: ${e.message}")
                 }
@@ -767,6 +785,10 @@ class DriverSession(
                 // samples actually start flowing, so a mode that keys without
                 // a stream of its own is never cut short by it.
                 lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
+                // The key-down instant anchors the no-stream and absolute
+                // ceilings: without it a keyed radio whose client died before
+                // the first sample had NO watchdog at all.
+                if (on) keyedAtMs = android.os.SystemClock.elapsedRealtime()
                 sendTxState()
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
@@ -958,6 +980,12 @@ class DriverSession(
 
     private suspend fun openDevice(kind: Int, host: String, port: Int, flags: Int) {
         closeDevice()
+        // One radio, one session. Reconnection races left a ZOMBIE session
+        // holding the same board — both threads fed it, with independent TX
+        // sequences, and the zombie kept asserting its (possibly keyed) MOX.
+        // The newest claim wins; the old owner is closed before this open
+        // touches the hardware.
+        claimDevice("$kind/$host:$port")
         // New client generation: stale callbacks from the replaced client
         // (its disconnect is asynchronous) are filtered from here on, so its
         // late "Disconnected" can never shadow this client's "Connected".
@@ -1052,7 +1080,20 @@ class DriverSession(
         else -> "?"
     }
 
+    /** Take ownership of a board, closing whichever session held it. */
+    private fun claimDevice(key: String) {
+        currentDeviceKey = key
+        val prev = deviceOwners.put(key, this)
+        if (prev != null && prev !== this) {
+            Log.w(TAG, "device $key claimed by a new session — closing the stale owner")
+            runCatching { prev.close() }
+        }
+    }
+
+    @Volatile private var currentDeviceKey: String? = null
+
     private fun closeDevice() {
+        currentDeviceKey?.let { deviceOwners.remove(it, this); currentDeviceKey = null }
         // Invalidate the outgoing clients' callbacks FIRST: their disconnect
         // paths are asynchronous and must not speak for the next client.
         clientGen.incrementAndGet()

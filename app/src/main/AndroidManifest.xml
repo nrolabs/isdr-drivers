@@ -33,6 +33,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Attach-time claim of every supported radio: with the filter
+                 declared, the system's permission dialog offers "use by
+                 default" and the grant becomes PERMANENT for that board —
+                 no per-session prompt, which a headless remote station has
+                 nobody around to answer. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
         </activity>
 
         <!-- Exported on purpose and without a permission gate: the iSDR app

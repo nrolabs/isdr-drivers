@@ -51,19 +51,44 @@ object TxWatchdogPolicy {
      */
     const val SILENCE_MS = 15_000L
 
+    /**
+     * A key-up that never streams a single block: 15 s and the carrier
+     * drops — the same bound as the silence rule, because a stream that
+     * never started is at least as dead as one that stopped. "Arms on the
+     * first sample" left this path with NO watchdog at all — a TCI client
+     * that keyed and died (or never sent audio) held the carrier forever.
+     */
+    const val NO_STREAM_MS = 15_000L
+
+    /**
+     * Absolute ceiling on one continuous key-down, stream or no stream.
+     * Ten minutes is beyond any legitimate over and is the radio-side
+     * backstop for every client-side limit that can be disabled or die
+     * with its process — the radio is the last thing standing, so the
+     * radio holds the line.
+     */
+    const val MAX_KEYED_MS = 600_000L
+
     /** Sentinel for "no transmit sample has arrived since key-up". */
     const val NOT_ARMED = 0L
 
     /**
      * @param pttOn whether the radio is currently keyed
+     * @param keyedAtMs monotonic time of the key-up itself
      * @param lastTxIqMs monotonic time of the last transmit block, or
      *   [NOT_ARMED] when none has arrived since key-up
      * @param nowMs current monotonic time
      */
-    fun shouldUnkey(pttOn: Boolean, lastTxIqMs: Long, nowMs: Long): Boolean {
-        // Arms on the first sample, never on key-up itself: a mode that keys
-        // without a stream of its own must not be cut short by this.
-        if (!pttOn || lastTxIqMs == NOT_ARMED) return false
-        return nowMs - lastTxIqMs >= SILENCE_MS
+    fun shouldUnkey(pttOn: Boolean, keyedAtMs: Long, lastTxIqMs: Long, nowMs: Long): Boolean {
+        if (!pttOn) return false
+        // Hard ceiling first: it holds regardless of what the stream does.
+        if (nowMs - keyedAtMs >= MAX_KEYED_MS) return true
+        return if (lastTxIqMs == NOT_ARMED) {
+            // Keyed and never streamed: a mode that keys without a stream of
+            // its own gets a generous window, not immunity.
+            nowMs - keyedAtMs >= NO_STREAM_MS
+        } else {
+            nowMs - lastTxIqMs >= SILENCE_MS
+        }
     }
 }
