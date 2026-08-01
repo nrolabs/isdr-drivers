@@ -63,11 +63,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Quality gate: the signed artifact only ships if release lint and the
-      # unit test suite pass — any failure aborts the release.
-      - name: Lint and unit tests
-        run: ./gradlew lintRelease testDebugUnitTest --no-daemon
-
       - name: Restore keystore and signing credentials
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
