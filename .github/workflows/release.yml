@@ -113,9 +113,13 @@ jobs:
           EOF
           aws s3 cp manifest.json "s3://$BUCKET/downloads/manifest.json" \
             --content-type application/json --only-show-errors
-          aws s3 ls "s3://$BUCKET/downloads/" | awk '{print $4}' \
-            | grep "^iSDR-Drivers-v" | grep -v "^${FILE}$" \
-            | while read -r old; do aws s3 rm "s3://$BUCKET/downloads/$old" --only-show-errors; done
+          # Só a última versão fica no bucket; sem versão antiga a lista é
+          # vazia — o grep sai 1 e NÃO pode derrubar o job (pipefail).
+          OLD=$(aws s3 ls "s3://$BUCKET/downloads/" | awk '{print $4}' \
+            | { grep "^iSDR-Drivers-v" || true; } | { grep -v "^${FILE}$" || true; })
+          for old in $OLD; do
+            aws s3 rm "s3://$BUCKET/downloads/$old" --only-show-errors
+          done
           aws cloudfront create-invalidation --distribution-id "$CF_DIST" \
             --paths "/downloads/*" >/dev/null
 
