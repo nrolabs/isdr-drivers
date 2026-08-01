@@ -13,8 +13,8 @@
     <string name="status_service_stopped">ドライバーサービス停止中</string>
     <string name="status_no_radio">開いている無線機なし</string>
     <string name="fmt_radio">無線機: %1$s</string>
+    <!-- Japanese has no singular/plural distinction: "other" covers every count. -->
     <plurals name="fmt_sessions">
-        <item quantity="one">%d 個のアプリが接続中</item>
         <item quantity="other">%d 個のアプリが接続中</item>
     </plurals>
 </resources>

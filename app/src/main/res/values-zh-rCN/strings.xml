@@ -13,8 +13,8 @@
     <string name="status_service_stopped">驱动服务已停止</string>
     <string name="status_no_radio">没有打开的电台</string>
     <string name="fmt_radio">电台：%1$s</string>
+    <!-- Chinese has no singular/plural distinction: "other" covers every count. -->
     <plurals name="fmt_sessions">
-        <item quantity="one">%d 个已连接应用</item>
         <item quantity="other">%d 个已连接应用</item>
     </plurals>
 </resources>

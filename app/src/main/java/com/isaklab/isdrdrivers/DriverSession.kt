@@ -89,6 +89,37 @@ class DriverSession(
         private val EMPTY_FLOATS = FloatArray(0)
 
         /**
+         * Inbound payload ceiling before CMD_AUTH succeeds. A token frame is
+         * a u16-prefixed string; 4 kB is already far more than one needs, and
+         * an unauthenticated peer gets no larger allocation than that.
+         */
+        private const val PRE_AUTH_PAYLOAD = 4096
+
+        /**
+         * Inbound payload ceiling once authenticated.
+         *
+         * Sized from the frames that actually arrive, not from the wire
+         * format's absolute limit:
+         *
+         *  - CMD_TX_IQ, the only bulk inbound opcode, carries i32 count plus
+         *    raw float32 interleaved IQ at the fixed 48 kSps TX rate. The app
+         *    submits one 1024-sample audio block at a time, i.e. 2048 floats:
+         *    4 + 2048*4 = 8196 bytes. The general form is
+         *    4 + 8 * audioBlockSamples.
+         *  - The largest inbound frame that is NOT IQ is a CMD_OPEN whose
+         *    host string uses the full u16 length: ~65.5 kB.
+         *
+         * One MiB is 128x the real TX block and 16x the largest legal
+         * CMD_OPEN — room for a TX block up to 128k audio samples (2.7 s of
+         * audio, far past anything the streaming path would batch) without
+         * anyone having to revisit this number. What it buys is the point:
+         * a peer that authenticated and then desynchronised, or went hostile,
+         * can force a 1 MiB array instead of a 64 MiB one, and the stream
+         * fails with an IOException into a clean reconnect.
+         */
+        private const val MAX_SESSION_PAYLOAD = 1024 * 1024
+
+        /**
          * Which session owns which radio (key = kind/host:port). The service
          * allows several sessions, but a BOARD tolerates exactly one driver:
          * two sessions on one HL2 interleave TX sequences and the stale one
@@ -341,10 +372,8 @@ class DriverSession(
     private fun readLoop() {
         try {
             while (!closed) {
-                // Before auth, cap the payload hard (a token frame is tiny) so
-                // an unauthenticated peer can't force a 64 MB allocation
-                // (audit H3). After auth the full limit applies.
-                val frame = frames.read(if (authenticated) Int.MAX_VALUE else 4096) ?: break
+                val frame = frames.read(if (authenticated) MAX_SESSION_PAYLOAD else PRE_AUTH_PAYLOAD)
+                    ?: break
                 handle(frame)
             }
         } catch (e: Exception) {

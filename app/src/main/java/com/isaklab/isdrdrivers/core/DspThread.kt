@@ -40,14 +40,55 @@ object DspThread {
      * Start [body] on a new thread named [name], pinned at [priority] before
      * the first line of the body runs. The thread is ours, so the priority
      * dies with it — nothing to restore, nothing to leak.
+     *
+     * The body runs under a catch-all. This is not defensive decoration: an
+     * uncaught throwable on ANY thread takes down the whole Android process
+     * via the default handler, and these loops sit on a socket that a
+     * concurrent teardown is allowed to close under them — a perfectly normal
+     * `SocketException` on a shutdown race would otherwise kill the host app.
+     * Nothing is swallowed: the throwable is always logged at ERROR with the
+     * thread name (so a genuine programming error still shows up in a bug
+     * report exactly as it would have), and [onFailure] is handed the same
+     * throwable so the caller can retire the session it belongs to. A failure
+     * inside [onFailure] itself is logged and dropped — there is no one left
+     * above it to tell.
      */
-    fun start(name: String, priority: Int, body: () -> Unit): Thread =
+    fun start(
+        name: String,
+        priority: Int,
+        onFailure: ((Throwable) -> Unit)? = null,
+        body: () -> Unit,
+    ): Thread = create(name, priority, onFailure, body).also { it.start() }
+
+    /**
+     * Same thread, not yet started. Use this when the handle has to be
+     * PUBLISHED before the loop can run: a shutdown path that reads the handle
+     * to stop the loop must never be able to see null while the loop is
+     * already on the wire. Publish, then [Thread.start].
+     */
+    fun create(
+        name: String,
+        priority: Int,
+        onFailure: ((Throwable) -> Unit)? = null,
+        body: () -> Unit,
+    ): Thread =
         Thread({
             try {
                 android.os.Process.setThreadPriority(priority)
             } catch (_: Throwable) { /* priority is an optimisation, not a requirement */ }
-            body()
-        }, name).also { it.isDaemon = true; it.start() }
+            try {
+                body()
+            } catch (t: Throwable) {
+                android.util.Log.e(TAG, "dsp thread '$name' died: ${t.javaClass.simpleName}: ${t.message}", t)
+                try {
+                    onFailure?.invoke(t)
+                } catch (u: Throwable) {
+                    android.util.Log.e(TAG, "dsp thread '$name' failure handler threw", u)
+                }
+            }
+        }, name).also { it.isDaemon = true }
+
+    private const val TAG = "DspThread"
 
     /**
      * Sleep until [deadlineNs] (a `System.nanoTime()` stamp), or return at once

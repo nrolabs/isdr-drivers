@@ -2,6 +2,10 @@
     <!-- Design-system alignment with the iSDR app: accent palette and
          sentence-case buttons (never ALL CAPS). -->
     <style name="Theme.IsdrDrivers" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!-- Painted by the window, not by the layout root: a root background on
+             top of the theme's would paint every pixel twice. DayNight picks
+             the light or dark value from colors.xml. -->
+        <item name="android:windowBackground">@color/background</item>
         <item name="colorAccent">@color/accentBlue</item>
         <item name="colorPrimary">@color/accentBlue</item>
         <item name="buttonStyle">@style/DsButton</item>
