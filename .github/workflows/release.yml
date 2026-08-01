@@ -19,6 +19,22 @@ jobs:
           submodules: recursive
           fetch-depth: 0   # full history for the commit-count versionCode
 
+      # settings.gradle.kts compõe repositórios irmãos em ../ — o runner os
+      # materializa aqui, pinados por siblings.lock (mesmo contrato do
+      # isdr-app), para o build de tag ser reproduzível.
+      - name: Materialize the pinned sibling modules
+        env:
+          WORKSPACE_PAT: ${{ secrets.WORKSPACE_PAT }}
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r name sha; do
+            case "$name" in ''|'#'*) continue ;; esac
+            echo "sibling $name @ $sha"
+            git clone --no-checkout \
+              "https://x-access-token:${WORKSPACE_PAT}@github.com/nrolabs/${name}.git" "../$name"
+            git -C "../$name" checkout --detach "$sha"
+          done < siblings.lock
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

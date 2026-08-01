@@ -1,0 +1,6 @@
+# Sibling module pins for CI builds — same contract as isdr-app/siblings.lock:
+# settings.gradle.kts composes ../isdr-proto; the release workflow clones it
+# at this exact commit so a tag build is reproducible. Bump in the same
+# commit that starts depending on a sibling change.
+# Format: <repo-name>=<commit-sha>, cloned from github.com/nrolabs/<repo-name>.
+isdr-proto=f9447f697192e940041582f25b817effaed47c92
