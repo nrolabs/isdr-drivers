@@ -88,8 +88,13 @@ jobs:
           V="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cp app/build/outputs/bundle/release/app-release.aab "dist/isdr-drivers-${V}.aab"
-          cp app/build/outputs/apk/release/app-release.apk "dist/isdr-drivers-${V}.apk" 2>/dev/null \
-            || cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/isdr-drivers-${V}.apk"
+          # One APK per ABI: a phone runs exactly one, and the universal
+          # package carried native code for three it can never load.
+          for apk in app/build/outputs/apk/release/app-*-release.apk; do
+            abi=$(basename "$apk" | sed -E 's/^app-(.*)-release\.apk$/\1/')
+            cp "$apk" "dist/isdr-drivers-${V}-${abi}.apk"
+          done
+          ls -la dist
 
       # Disabled: the manifest is assembled by hand while the catalogue
       # grows beyond Android. Uncomment to restore; the secrets are still set.
