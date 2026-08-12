@@ -91,59 +91,61 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk "dist/isdr-drivers-${V}.apk" 2>/dev/null \
             || cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/isdr-drivers-${V}.apk"
 
-      - name: Check AWS secrets
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        run: |
-          if [ -n "$KEY" ]; then echo "AWS_OK=true" >> "$GITHUB_ENV";
-          else echo "AWS_OK=false" >> "$GITHUB_ENV";
-               echo "::warning::AWS secrets ausentes - APK nao copiado para o bucket do site"; fi
+      # Disabled: the manifest is assembled by hand while the catalogue
+      # grows beyond Android. Uncomment to restore; the secrets are still set.
+      #- name: Check AWS secrets
+      #  if: startsWith(github.ref, 'refs/tags/')
+      #  env:
+      #    KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #  run: |
+      #    if [ -n "$KEY" ]; then echo "AWS_OK=true" >> "$GITHUB_ENV";
+      #    else echo "AWS_OK=false" >> "$GITHUB_ENV";
+      #         echo "::warning::AWS secrets ausentes - APK nao copiado para o bucket do site"; fi
 
-      # Copia do APK para o bucket do site (pagina App iSDR do id.qsl.br):
-      # sobe a versao nova, reescreve o manifest.json mantendo SO a ultima de
-      # cada app (e o que a pagina mostra) e apaga as versoes antigas. Sem os
-      # secrets AWS o passo e pulado e a release do GitHub sai normalmente.
-      - name: Publish APK to the site bucket
-        if: startsWith(github.ref, 'refs/tags/') && env.AWS_OK == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          BUCKET: id-qsl-br-downloads
-          CF_DIST: E3M83V4Y4NNLCH
-        run: |
-          set -euo pipefail
-          V="${GITHUB_REF_NAME#v}"
-          SRC=$(ls dist/*.apk | head -1)
-          FILE="iSDR-Drivers-v${V}.apk"
-          aws s3 cp "$SRC" "s3://$BUCKET/downloads/$FILE" \
-            --content-type application/vnd.android.package-archive --only-show-errors
-          aws s3 cp "s3://$BUCKET/downloads/manifest.json" manifest.json \
-            --only-show-errors || echo '{"apps":[]}' > manifest.json
-          python3 - "$SRC" "$FILE" "$V" <<'EOF'
-          import hashlib, json, sys
-          src, file, ver = sys.argv[1:4]
-          data = open(src, "rb").read()
-          m = json.load(open("manifest.json"))
-          apps = [a for a in m.get("apps", []) if a.get("app") != "isdr-drivers"]
-          apps.append({"app": "isdr-drivers", "name": "iSDR Drivers", "version": ver,
-                       "file": file, "size_bytes": len(data),
-                       "sha256": hashlib.sha256(data).hexdigest()})
-          json.dump({"apps": sorted(apps, key=lambda a: a["app"])},
-                    open("manifest.json", "w"), indent=2)
-          EOF
-          aws s3 cp manifest.json "s3://$BUCKET/downloads/manifest.json" \
-            --content-type application/json --only-show-errors
-          # Só a última versão fica no bucket; sem versão antiga a lista é
-          # vazia — o grep sai 1 e NÃO pode derrubar o job (pipefail).
-          OLD=$(aws s3 ls "s3://$BUCKET/downloads/" | awk '{print $4}' \
-            | { grep "^iSDR-Drivers-v" || true; } | { grep -v "^${FILE}$" || true; })
-          for old in $OLD; do
-            aws s3 rm "s3://$BUCKET/downloads/$old" --only-show-errors
-          done
-          aws cloudfront create-invalidation --distribution-id "$CF_DIST" \
-            --paths "/downloads/*" >/dev/null
+      ## Copia do APK para o bucket do site (pagina App iSDR do id.qsl.br):
+      ## sobe a versao nova, reescreve o manifest.json mantendo SO a ultima de
+      ## cada app (e o que a pagina mostra) e apaga as versoes antigas. Sem os
+      ## secrets AWS o passo e pulado e a release do GitHub sai normalmente.
+      #- name: Publish APK to the site bucket
+      #  if: startsWith(github.ref, 'refs/tags/') && env.AWS_OK == 'true'
+      #  env:
+      #    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #    AWS_DEFAULT_REGION: us-east-1
+      #    BUCKET: id-qsl-br-downloads
+      #    CF_DIST: E3M83V4Y4NNLCH
+      #  run: |
+      #    set -euo pipefail
+      #    V="${GITHUB_REF_NAME#v}"
+      #    SRC=$(ls dist/*.apk | head -1)
+      #    FILE="iSDR-Drivers-v${V}.apk"
+      #    aws s3 cp "$SRC" "s3://$BUCKET/downloads/$FILE" \
+      #      --content-type application/vnd.android.package-archive --only-show-errors
+      #    aws s3 cp "s3://$BUCKET/downloads/manifest.json" manifest.json \
+      #      --only-show-errors || echo '{"apps":[]}' > manifest.json
+      #    python3 - "$SRC" "$FILE" "$V" <<'EOF'
+      #    import hashlib, json, sys
+      #    src, file, ver = sys.argv[1:4]
+      #    data = open(src, "rb").read()
+      #    m = json.load(open("manifest.json"))
+      #    apps = [a for a in m.get("apps", []) if a.get("app") != "isdr-drivers"]
+      #    apps.append({"app": "isdr-drivers", "name": "iSDR Drivers", "version": ver,
+      #                 "file": file, "size_bytes": len(data),
+      #                 "sha256": hashlib.sha256(data).hexdigest()})
+      #    json.dump({"apps": sorted(apps, key=lambda a: a["app"])},
+      #              open("manifest.json", "w"), indent=2)
+      #    EOF
+      #    aws s3 cp manifest.json "s3://$BUCKET/downloads/manifest.json" \
+      #      --content-type application/json --only-show-errors
+      #    # Só a última versão fica no bucket; sem versão antiga a lista é
+      #    # vazia — o grep sai 1 e NÃO pode derrubar o job (pipefail).
+      #    OLD=$(aws s3 ls "s3://$BUCKET/downloads/" | awk '{print $4}' \
+      #      | { grep "^iSDR-Drivers-v" || true; } | { grep -v "^${FILE}$" || true; })
+      #    for old in $OLD; do
+      #      aws s3 rm "s3://$BUCKET/downloads/$old" --only-show-errors
+      #    done
+      #    aws cloudfront create-invalidation --distribution-id "$CF_DIST" \
+      #      --paths "/downloads/*" >/dev/null
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
