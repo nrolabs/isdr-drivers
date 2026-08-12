@@ -17,7 +17,18 @@ import java.util.concurrent.TimeUnit
  * utilizing double-buffering pre-allocated arrays to guarantee zero-allocation
  * handoffs. Register access is serialized elsewhere to avoid contentions.
  */
-class SpectrumWorker(private val fft: FFTProcessor) {
+class SpectrumWorker(fft: FFTProcessor) {
+
+    private val zoomed = ZoomedSpectrum(fft)
+
+    /**
+     * Narrow the panadapter's span before the transform; returns the
+     * decimation actually in force.
+     */
+    fun setZoom(decimation: Int, offsetHz: Double, rateHz: Double): Int =
+        synchronized(zoomed) { zoomed.setZoom(decimation, offsetHz, rateHz) }
+
+    val zoomDecimation: Int get() = synchronized(zoomed) { zoomed.decimation }
 
     @Volatile var latest: FloatArray? = null
         private set
@@ -42,7 +53,7 @@ class SpectrumWorker(private val fft: FFTProcessor) {
                 val job = try {
                     queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 } catch (e: InterruptedException) { break }
-                fft.computePowerSpectrum(job.iq, job.pairs)?.let { latest = it }
+                synchronized(zoomed) { zoomed.compute(job.iq, job.pairs) }?.let { latest = it }
             }
         }, "spectrum-fft").also { it.start() }
     }
@@ -71,7 +82,7 @@ class SpectrumWorker(private val fft: FFTProcessor) {
         queue.offer(Job(buf, pairs))
     }
 
-    fun resetSmoothing() = fft.resetSmoothing()
+    fun resetSmoothing() = zoomed.fft.resetSmoothing()
 
     fun stop() {
         running = false

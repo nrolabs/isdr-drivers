@@ -553,6 +553,19 @@ class DriverSession(
         if (gen == clientGen.get()) onStatus(connected, status)
     }
 
+    /**
+     * The panadapter window actually in force. Through the queue, never
+     * dropped: an app that missed this frame would label its axis with a span
+     * the driver is not delivering.
+     */
+    private fun sendSpectrumZoom(decimation: Int, offsetHz: Long) {
+        val b = java.nio.ByteBuffer.allocate(12)
+        b.putInt(decimation)
+        b.putLong(offsetHz)
+        b.flip()
+        enqueue(OutEntry(0, null, 0, { frames.write(DriverProto.EV_SPECTRUM_ZOOM, b) }, droppable = false))
+    }
+
     private fun sendTelemetry(t: RadioTelemetry) =
         enqueue(OutEntry(0, null, 0, { frames.writeTelemetry(t) }, droppable = true))
 
@@ -801,6 +814,22 @@ class DriverSession(
             }
             DriverProto.CMD_SET_ANALOG_FILTER -> p.int.let { hz ->
                 (radio as? AnalogFilterCapable)?.setAnalogFilterHz(hz)
+            }
+            DriverProto.CMD_SET_SPECTRUM_ZOOM -> {
+                val decimation = p.int
+                val offsetHz = p.long
+                // Answered with what is IN FORCE, not with what was asked
+                // for: a radio with no session yet, or one that cannot narrow
+                // at all, stays at 1 and the app must draw the whole span.
+                val got = when (val r = radio) {
+                    is com.isaklab.libhl2sdrk.Hl2Client -> r.setSpectrumZoom(decimation, offsetHz)
+                    is com.isaklab.libg2sdrk.G2Client -> r.setSpectrumZoom(decimation, offsetHz)
+                    is com.isaklab.librtlsdrk.RTLTCPClient -> r.setSpectrumZoom(decimation, offsetHz)
+                    is com.isaklab.librtlsdrk.RTLUSBClient -> r.setSpectrumZoom(decimation, offsetHz)
+                    is com.isaklab.libhackrfk.HackRfClient -> r.setSpectrumZoom(decimation, offsetHz)
+                    else -> 1
+                }
+                sendSpectrumZoom(got, offsetHz)
             }
 
             // TX

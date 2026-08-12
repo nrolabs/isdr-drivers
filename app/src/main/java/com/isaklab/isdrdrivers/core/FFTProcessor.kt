@@ -149,6 +149,10 @@ class FFTProcessor(private val fftSize: Int = SDRConfig.FFT_SIZE) {
         }
     }
 
+    /** Bins the transform produces: the display's resolution, once divided
+     *  into the span it covers. */
+    val bins: Int get() = fftSize
+
     fun reset() {
         previousSpectrum = null
         dcI = 0.0
