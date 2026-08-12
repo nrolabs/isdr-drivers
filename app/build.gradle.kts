@@ -61,19 +61,6 @@ android {
         }
     }
 
-    // One APK per architecture instead of one carrying all four. A phone runs
-    // exactly one ABI: the universal package shipped ~89 MB of native code no
-    // device would ever load, and the ONNX runtime alone is ~29 MB per ABI.
-    // Debug keeps every ABI so the x86_64 emulators still install.
-    splits {
-        abi {
-            isEnable = true
-            reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
-            isUniversalApk = false
-        }
-    }
-
     buildTypes {
         release {
             // This app ships its GPL sources verbatim; shrinking would only
