@@ -53,6 +53,23 @@ interface RadioClient {
     fun setFrequency(hz: Long)
 
     /**
+     * The frequency the receiver is programmed to right now, in Hz — the
+     * truth-over-request rule of [sampleRateHz]: what the hardware is on,
+     * including a power-up default no session has touched. Zero means the
+     * driver cannot say, and the host then announces nothing rather than a
+     * guess (EV_FREQUENCY).
+     */
+    fun frequencyHz(): Long = 0
+
+    /**
+     * The rate the hardware is actually running, in Hz — not necessarily the
+     * one that was asked for. The host announces it as EV_SAMPLE_RATE at
+     * open and after every rate command, so the app scales its spectrum and
+     * audio decimation by the truth. Zero = cannot say, nothing announced.
+     */
+    fun sampleRateHz(): Int = 0
+
+    /**
      * Set the sampling rate, in Hz. A radio that cannot honour the exact value
      * is expected to apply the nearest rate it can rather than refuse.
      */

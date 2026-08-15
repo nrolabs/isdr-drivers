@@ -804,8 +804,20 @@ class DriverSession(
             // The common set goes through the contract, not through one line
             // per radio. A radio added later is reached here the moment it is
             // constructed, with nothing to remember to extend.
-            DriverProto.CMD_SET_FREQUENCY -> radio?.setFrequency(p.long)
-            DriverProto.CMD_SET_SAMPLE_RATE -> radio?.setSampleRate(p.int)
+            DriverProto.CMD_SET_FREQUENCY -> {
+                radio?.setFrequency(p.long)
+                // Answered, always, with what is IN FORCE (EV_FREQUENCY):
+                // the app reconciles its display against the hardware's
+                // truth, so a tune that was clamped or lost can never leave
+                // the two sides silently apart. Zero = cannot say = silence.
+                announceFrequency()
+            }
+            DriverProto.CMD_SET_SAMPLE_RATE -> {
+                radio?.setSampleRate(p.int)
+                // The rate rule (EV_SAMPLE_RATE): the app scales spectrum,
+                // NCO and audio decimation by the rate the hardware RUNS.
+                announceSampleRate()
+            }
             DriverProto.CMD_SET_SPECTRUM_INTEREST -> p.getBool().let { on ->
                 radio?.spectrumEnabled = on
             }
@@ -1130,6 +1142,26 @@ class DriverSession(
         }
         if (!ok) closeDevice()
         send { frames.writeBool(DriverProto.EV_OPEN_RESULT, ok) }
+        // The state in force the moment the radio opens, BEFORE the app has
+        // set anything: whatever the hardware powered up on or a previous
+        // session left it holding. Announcing both means there is no window
+        // in which the two sides disagree unnoticed.
+        if (ok) {
+            announceSampleRate()
+            announceFrequency()
+        }
+    }
+
+    /** EV_FREQUENCY with the frequency in force; zero (cannot say) is never announced. */
+    private fun announceFrequency() {
+        val hz = radio?.frequencyHz() ?: return
+        if (hz > 0) send { frames.writeI64(DriverProto.EV_FREQUENCY, hz) }
+    }
+
+    /** EV_SAMPLE_RATE with the rate in force; zero (cannot say) is never announced. */
+    private fun announceSampleRate() {
+        val hz = radio?.sampleRateHz() ?: return
+        if (hz > 0) send { frames.writeI32(DriverProto.EV_SAMPLE_RATE, hz) }
     }
 
     private fun radioName(kind: Int, flags: Int): String = when (kind) {
