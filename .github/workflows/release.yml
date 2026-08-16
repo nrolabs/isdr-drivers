@@ -2,8 +2,9 @@ name: Build & Release
 
 # Triggered by pushing a version tag (e.g. v1.0, v1.1) or manually.
 on:
-  push:
-    tags: ["v*"]
+  # Manual only. Automatic runs on tags/pushes are switched off: releases are
+  # built on the maintainer's machine with the local suite (tools/build in the
+  # workspace) and published from there. Trigger by hand if ever needed.
   workflow_dispatch:
 
 permissions:
