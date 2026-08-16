@@ -76,6 +76,16 @@ interface RadioClient {
     fun setSampleRate(hz: Int)
 
     /**
+     * Drivers that apply frequency / rate commands ASYNCHRONOUSLY (a USB
+     * command queue) call [listener] once the hardware state actually
+     * changed, so the host can announce the truth then — announcing right
+     * after the queue accepted the request reports the OLD state and the
+     * app scales its display by a rate the radio is no longer running.
+     * Synchronous drivers may ignore it (the host announces after the call).
+     */
+    fun setStateListener(listener: (() -> Unit)?) {}
+
+    /**
      * When false, blocks are delivered with an empty spectrum and the FFT is
      * skipped, because nothing on screen is consuming it. IQ delivery for
      * audio must be unaffected.

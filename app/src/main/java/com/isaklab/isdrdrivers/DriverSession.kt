@@ -1147,6 +1147,12 @@ class DriverSession(
         // session left it holding. Announcing both means there is no window
         // in which the two sides disagree unnoticed.
         if (ok) {
+            // Queued drivers report back when a rate/frequency command has
+            // actually been applied; announce the truth at that moment too.
+            radio?.setStateListener {
+                announceSampleRate()
+                announceFrequency()
+            }
             announceSampleRate()
             announceFrequency()
         }
@@ -1194,6 +1200,7 @@ class DriverSession(
         // paths are asynchronous and must not speak for the next client.
         clientGen.incrementAndGet()
         val hadClient = radio != null
+        radio?.setStateListener(null)
         try {
             // Never leave the air keyed behind a closing session.
             (radio as? TransmitCapable)?.setPtt(false)
