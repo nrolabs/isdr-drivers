@@ -43,6 +43,9 @@ import kotlin.concurrent.thread
  */
 class DriverService : Service() {
 
+    /** CPU + Wi-Fi awake while any session streams a radio (see RadioLocks). */
+    private val locks by lazy { RadioLocks(this, "isdr-drivers") }
+
     companion object {
         private const val TAG = "DriverService"
         private const val CHANNEL_ID = "proxy"
@@ -232,7 +235,9 @@ class DriverService : Service() {
                     // clears it once authenticated.
                     socket.soTimeout = AUTH_TIMEOUT_MS
                     Log.i(TAG, "session accepted")
+                    locks.acquire()
                     val session = DriverSession(applicationContext, socket, token) { done ->
+                        locks.release()
                         sessions.remove(done)
                         DriverServiceState.update { it.copy(sessions = sessions.size) }
                         if (sessions.isEmpty() && !stopping) {
@@ -252,6 +257,7 @@ class DriverService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        locks.releaseAll()
         try {
             server?.close()
         } catch (_: Exception) {
