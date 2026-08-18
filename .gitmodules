@@ -10,3 +10,9 @@
 [submodule "app/src/main/java/com/isaklab/libg2sdrk"]
 	path = app/src/main/java/com/isaklab/libg2sdrk
 	url = ../libg2sdrk
+[submodule "app/src/main/java/com/isaklab/libcivk"]
+	path = app/src/main/java/com/isaklab/libcivk
+	url = ../libcivk
+[submodule "app/src/main/java/com/isaklab/libkenwoodk"]
+	path = app/src/main/java/com/isaklab/libkenwoodk
+	url = ../libkenwoodk
