@@ -33,6 +33,9 @@ import com.isaklab.isdrproto.RadioTelemetry
 import com.isaklab.isdrproto.getBool
 import com.isaklab.isdrproto.getFloats
 import com.isaklab.isdrproto.getUtf
+import com.isaklab.libcivk.CivClient
+import com.isaklab.libcivk.TcpTransport
+import com.isaklab.libcivk.UsbCdcTransport
 import com.isaklab.libg2sdrk.G2Client
 import com.isaklab.libg2sdrk.G2Protocol
 import com.isaklab.libhackrfk.HackRfClient
@@ -265,6 +268,7 @@ class DriverSession(
     // private var flex: com.isaklab.libflexk.FlexClient? = null
     private var hl2: Hl2Client? = null
     private var g2: G2Client? = null
+    private var cat: CivClient? = null
 
     /**
      * Client generation, bumped on every open/close. Driver callbacks carry
@@ -725,7 +729,8 @@ class DriverSession(
     // )
 
     private fun sendTxState() {
-        val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting() ?: false
+        val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting()
+            ?: cat?.isTransmitting() ?: false
         send { frames.writeBool(DriverProto.EV_TX_STATE, tx) }
     }
 
@@ -1050,6 +1055,11 @@ class DriverSession(
             }
             // rtl_tcp has no bandwidth opcode; USB only.
 
+            // CAT rig: operating mode by the dialect's own mode code (the
+            // rig switches its demodulator and passband — there is no local
+            // demodulation to configure for a spectrum-only radio).
+            DriverProto.CMD_CAT_SET_MODE -> cat?.setMode(p.int)
+
             else -> Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)}")
         }
     }
@@ -1134,6 +1144,32 @@ class DriverSession(
                     radio = c
                     c.connect()
                 }
+                DriverProto.DEV_CAT -> {
+                    // Open payload contract (DriverProto.DEV_CAT): host empty
+                    // or "usb" = the rig's USB-CDC serial port with port as
+                    // the baud rate (0 = 115200); anything else = a TCP
+                    // serial bridge with port as the TCP port (0 = 4532).
+                    // The flags low byte is the CI-V bus address (0 = probe).
+                    val transport = if (host.isEmpty() || host == "usb") {
+                        val t = UsbCdcTransport(context, if (port > 0) port else 115200)
+                        if (!t.open()) {
+                            onStatus(false, "No USB serial adapter found")
+                            null
+                        } else {
+                            t
+                        }
+                    } else {
+                        TcpTransport(host, if (port > 0) port else 4532)
+                    }
+                    if (transport == null) {
+                        false
+                    } else {
+                        val c = CivClient(transport, flags and 0xFF, ::onData, onStatusGen)
+                        cat = c
+                        radio = c
+                        c.connect()
+                    }
+                }
                 else -> false
             }
         } catch (e: Exception) {
@@ -1179,6 +1215,7 @@ class DriverSession(
             if (flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0) "ANAN (Protocol 1)"
             else "Hermes-Lite 2"
         DriverProto.DEV_G2 -> "ANAN-G2 (Saturn)"
+        DriverProto.DEV_CAT -> "CAT rig"
         else -> "?"
     }
 
@@ -1216,6 +1253,7 @@ class DriverSession(
         hackRf = null
         hl2 = null
         g2 = null
+        cat = null
         DriverServiceState.update {
             it.copy(radio = null, radioStatus = null, radioConnected = false)
         }
