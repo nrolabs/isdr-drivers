@@ -3,4 +3,4 @@
 # at this exact commit so a tag build is reproducible. Bump in the same
 # commit that starts depending on a sibling change.
 # Format: <repo-name>=<commit-sha>, cloned from github.com/nrolabs/<repo-name>.
-isdr-proto=d92d7f3c321ed26296619ef53413a3525dd1e69f
+isdr-proto=232abdccc7e4d49a1f59ad1bb48fdb6ebcf314c0
