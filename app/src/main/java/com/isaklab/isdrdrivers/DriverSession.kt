@@ -36,6 +36,7 @@ import com.isaklab.isdrproto.getUtf
 import com.isaklab.libcivk.CivClient
 import com.isaklab.libcivk.TcpTransport
 import com.isaklab.libcivk.UsbCdcTransport
+import com.isaklab.libkenwoodk.KenwoodClient
 import com.isaklab.libg2sdrk.G2Client
 import com.isaklab.libg2sdrk.G2Protocol
 import com.isaklab.libhackrfk.HackRfClient
@@ -269,6 +270,7 @@ class DriverSession(
     private var hl2: Hl2Client? = null
     private var g2: G2Client? = null
     private var cat: CivClient? = null
+    private var kenwoodCat: KenwoodClient? = null
 
     /**
      * Client generation, bumped on every open/close. Driver callbacks carry
@@ -730,7 +732,7 @@ class DriverSession(
 
     private fun sendTxState() {
         val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting()
-            ?: cat?.isTransmitting() ?: false
+            ?: cat?.isTransmitting() ?: kenwoodCat?.isTransmitting() ?: false
         send { frames.writeBool(DriverProto.EV_TX_STATE, tx) }
     }
 
@@ -1058,7 +1060,10 @@ class DriverSession(
             // CAT rig: operating mode by the dialect's own mode code (the
             // rig switches its demodulator and passband — there is no local
             // demodulation to configure for a spectrum-only radio).
-            DriverProto.CMD_CAT_SET_MODE -> cat?.setMode(p.int)
+            DriverProto.CMD_CAT_SET_MODE -> p.int.let { m ->
+                cat?.setMode(m)
+                kenwoodCat?.setMode(m)
+            }
 
             else -> Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)}")
         }
@@ -1144,31 +1149,100 @@ class DriverSession(
                     radio = c
                     c.connect()
                 }
-                DriverProto.DEV_CAT -> {
-                    // Open payload contract (DriverProto.DEV_CAT): host empty
-                    // or "usb" = the rig's USB-CDC serial port with port as
-                    // the baud rate (0 = 115200); anything else = a TCP
-                    // serial bridge with port as the TCP port (0 = 4532).
-                    // The flags low byte is the CI-V bus address (0 = probe).
-                    val transport = if (host.isEmpty() || host == "usb") {
-                        val t = UsbCdcTransport(context, if (port > 0) port else 115200)
-                        if (!t.open()) {
-                            onStatus(false, "No USB serial adapter found")
-                            null
+                DriverProto.DEV_CAT -> when (DriverProto.catDialect(flags)) {
+                    DriverProto.CAT_DIALECT_CIV -> {
+                        // Open payload contract (DriverProto.DEV_CAT): host
+                        // empty or "usb" = the rig's USB-CDC serial port with
+                        // port as the baud rate (0 = 115200); anything else =
+                        // a TCP serial bridge with port as the TCP port
+                        // (0 = 4532). The flags low byte is the CI-V bus
+                        // address (0 = probe).
+                        val transport = if (host.isEmpty() || host == "usb") {
+                            val t = UsbCdcTransport(context, if (port > 0) port else 115200)
+                            if (!t.open()) {
+                                onStatus(false, "No USB serial adapter found")
+                                null
+                            } else {
+                                t
+                            }
                         } else {
-                            t
+                            TcpTransport(host, if (port > 0) port else 4532)
                         }
-                    } else {
-                        TcpTransport(host, if (port > 0) port else 4532)
+                        if (transport == null) {
+                            false
+                        } else {
+                            val c = CivClient(transport, flags and 0xFF, ::onData, onStatusGen)
+                            cat = c
+                            radio = c
+                            c.connect()
+                        }
                     }
-                    if (transport == null) {
+                    DriverProto.CAT_DIALECT_KENWOOD -> {
+                        // Kenwood KNS carries no credential fields in the
+                        // open, so the host string may be user:password@host
+                        // — split on the LAST '@' and the FIRST ':' so a
+                        // password may contain either character. Host empty
+                        // or "usb" = the rig's USB-CDC serial port with port
+                        // as the baud rate (0 = 115200); anything else = the
+                        // KNS TCP port (0 = 60000).
+                        val at = host.lastIndexOf('@')
+                        val target = if (at >= 0) host.substring(at + 1) else host
+                        val credentials = if (at >= 0) {
+                            val userinfo = host.substring(0, at)
+                            val colon = userinfo.indexOf(':')
+                            if (colon >= 0) {
+                                Pair(userinfo.substring(0, colon), userinfo.substring(colon + 1))
+                            } else {
+                                Pair(userinfo, "")
+                            }
+                        } else {
+                            null
+                        }
+                        val serial = target.isEmpty() || target == "usb"
+                        val transport = if (serial) {
+                            val t = UsbCdcTransport(context, if (port > 0) port else 115200)
+                            if (!t.open()) {
+                                onStatus(false, "No USB serial adapter found")
+                                null
+                            } else {
+                                t
+                            }
+                        } else {
+                            TcpTransport(target, if (port > 0) port else 60000)
+                        }
+                        if (transport == null) {
+                            false
+                        } else {
+                            val c = KenwoodClient(
+                                transport,
+                                if (serial) KenwoodClient.Link.SERIAL else KenwoodClient.Link.LAN,
+                                credentials,
+                                ::onData,
+                                onStatusGen,
+                            )
+                            kenwoodCat = c
+                            radio = c
+                            c.connect()
+                        }
+                    }
+                    else -> {
+                        onStatus(false, "unknown CAT dialect in the open flags")
                         false
-                    } else {
-                        val c = CivClient(transport, flags and 0xFF, ::onData, onStatusGen)
-                        cat = c
-                        radio = c
-                        c.connect()
                     }
+                }
+                DriverProto.DEV_ICOM_IQ -> {
+                    // Native Icom IQ (IC-7610/IC-R8600) is served by the
+                    // desktop host; the dedicated USB IQ port is out of scope
+                    // for the phone driver. Answer with a REFUSAL rather than
+                    // falling through to the "unknown device" path, so an
+                    // operator who asks for it is told why instead of
+                    // watching a connect that never completes.
+                    onStatus(
+                        false,
+                        "Icom native IQ (IC-7610/IC-R8600) is served by the desktop host; " +
+                            "phone USB is out of scope",
+                    )
+                    false
                 }
                 else -> false
             }
@@ -1215,7 +1289,10 @@ class DriverSession(
             if (flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0) "ANAN (Protocol 1)"
             else "Hermes-Lite 2"
         DriverProto.DEV_G2 -> "ANAN-G2 (Saturn)"
-        DriverProto.DEV_CAT -> "CAT rig"
+        DriverProto.DEV_CAT ->
+            if (DriverProto.catDialect(flags) == DriverProto.CAT_DIALECT_KENWOOD) "Kenwood"
+            else "CAT rig"
+        DriverProto.DEV_ICOM_IQ -> "Icom IQ"
         else -> "?"
     }
 
@@ -1254,6 +1331,7 @@ class DriverSession(
         hl2 = null
         g2 = null
         cat = null
+        kenwoodCat = null
         DriverServiceState.update {
             it.copy(radio = null, radioStatus = null, radioConnected = false)
         }
