@@ -128,6 +128,112 @@ class CivProtocolTest {
     }
 
     @Test
+    fun `receive control command bodies`() {
+        // Squelch 128: 4-digit big-endian BCD level.
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x03, 0x01, 0x28, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_SQL, 128),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x02, 0x02, 0x55, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_RF, 255),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x07, 0x01, 0x28, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_PBT_IN, 128),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x08, 0x00, 0x00, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_PBT_OUT, 0),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x06, 0x02, 0x55, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_NR, 255),
+        )
+
+        // Functions carry one plain data byte.
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x16, 0x40, 0x01, 0xFD),
+            P.setFunc(0x94, P.SUB_FUNC_NR, 1),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x16, 0x22, 0x00, 0xFD),
+            P.setFunc(0x94, P.SUB_FUNC_NB, 0),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x16, 0x41, 0x01, 0xFD),
+            P.setFunc(0x94, P.SUB_FUNC_NOTCH_AUTO, 1),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x16, 0x12, 0x02, 0xFD),
+            P.setFunc(0x94, P.SUB_FUNC_AGC, P.AGC_MID),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x16, 0x02, 0x01, 0xFD),
+            P.setFunc(0x94, P.SUB_FUNC_PREAMP, 1),
+        )
+    }
+
+    @Test
+    fun `attenuator travels as one bcd byte`() {
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x11, 0x12, 0xFD),
+            P.setAttenuator(0x94, 12)!!,
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x11, 0x00, 0xFD),
+            P.setAttenuator(0x94, 0)!!,
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x11, 0x45, 0xFD),
+            P.setAttenuator(0x94, 45)!!,
+        )
+        assertNull(P.setAttenuator(0x94, 100))
+    }
+
+    @Test
+    fun `width code tables per mode`() {
+        // SSB/CW table: codes 0..9 are 50..500 in 50 Hz steps.
+        assertEquals(0, P.widthCodeForMode(P.MODE_USB, 50))
+        assertEquals(9, P.widthCodeForMode(P.MODE_CW, 500))
+        // Codes 10..40 are 600..3600 in 100 Hz steps.
+        assertEquals(10, P.widthCodeForMode(P.MODE_LSB, 600))
+        assertEquals(28, P.widthCodeForMode(P.MODE_USB, 2400))
+        assertEquals(40, P.widthCodeForMode(P.MODE_RTTY_R, 3600))
+        // Snapping to the nearest code, clamped at the table ends.
+        assertEquals(0, P.widthCodeForMode(P.MODE_USB, 1))
+        assertEquals(28, P.widthCodeForMode(P.MODE_USB, 2380))
+        assertEquals(40, P.widthCodeForMode(P.MODE_USB, 90_000))
+        // AM table: codes 0..49 are 200..10000 in 200 Hz steps.
+        assertEquals(0, P.widthCodeForMode(P.MODE_AM, 200))
+        assertEquals(29, P.widthCodeForMode(P.MODE_AM, 6000))
+        assertEquals(49, P.widthCodeForMode(P.MODE_AM, 10_000))
+        assertEquals(49, P.widthCodeForMode(P.MODE_AM, 50_000))
+        // FM has no width command.
+        assertNull(P.widthCodeForMode(P.MODE_FM, 12_000))
+    }
+
+    @Test
+    fun `filter width command carries the bcd code`() {
+        // USB 2400 Hz = code 28 = BCD 0x28.
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x1A, 0x03, 0x28, 0xFD),
+            P.setFilterWidth(0x94, P.MODE_USB, 2400)!!,
+        )
+        // SSB/CW code 40 (3600 Hz) = BCD 0x40.
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x1A, 0x03, 0x40, 0xFD),
+            P.setFilterWidth(0x94, P.MODE_CW, 3600)!!,
+        )
+        // AM 6000 Hz = code 29 = BCD 0x29.
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x1A, 0x03, 0x29, 0xFD),
+            P.setFilterWidth(0x94, P.MODE_AM, 6000)!!,
+        )
+        assertNull(P.setFilterWidth(0x94, P.MODE_FM, 12_000))
+    }
+
+    @Test
     fun `scope command bodies`() {
         assertArrayEquals(
             bytes(0xFE, 0xFE, 0x94, 0xE0, 0x27, 0x10, 0x01, 0xFD),

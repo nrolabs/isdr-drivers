@@ -515,4 +515,202 @@ class KenwoodClientTest {
         c.setFrequency(7_000_000) // must not hang or panic after teardown
         assertEquals(14_100_000L, c.frequencyHz())
     }
+
+    // ---- receive controls ----------------------------------------------------
+
+    @Test
+    fun `set control levels confirm by read back`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        // CATCTL_RF_GAIN drives RG, CATCTL_SQUELCH SQ, CATCTL_AF_GAIN AG.
+        h.on("RG;", "RG200;")
+        assertTrue(c.setControl(2, 200))
+        assertEquals(1, h.writesOf("RG200;"))
+        h.on("SQ;", "SQ000;")
+        assertTrue(c.setControl(3, 0))
+        assertEquals(1, h.writesOf("SQ000;"))
+        h.on("AG;", "AG128;")
+        assertTrue(c.setControl(13, 128))
+        assertEquals(1, h.writesOf("AG128;"))
+
+        // A read-back that disagrees is a failed set.
+        h.on("RG;", "RG180;")
+        assertFalse(c.setControl(2, 190))
+        // The rig's `?;` rejection is a failed set too.
+        h.on("SQ;", "?;")
+        assertFalse(c.setControl(3, 50))
+
+        // Out-of-range values never touch the wire.
+        assertFalse(c.setControl(2, 256))
+        assertFalse(c.setControl(13, -1))
+        assertEquals(0, h.writesOf("RG256;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `set control agc maps the reversed digit scale`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        // App 1 fast = GC3, 2 mid = GC2, 3 slow = GC1, 0 off = GC0.
+        h.on("GC;", "GC3;")
+        assertTrue(c.setControl(7, 1))
+        assertEquals(1, h.writesOf("GC3;"))
+        h.on("GC;", "GC2;")
+        assertTrue(c.setControl(7, 2))
+        assertEquals(1, h.writesOf("GC2;"))
+        h.on("GC;", "GC1;")
+        assertTrue(c.setControl(7, 3))
+        assertEquals(1, h.writesOf("GC1;"))
+        h.on("GC;", "GC0;")
+        assertTrue(c.setControl(7, 0))
+        assertEquals(1, h.writesOf("GC0;"))
+
+        assertFalse(c.setControl(7, 4))
+        assertEquals(0, h.writesOf("GC4;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `set control nr drives nr1 and its rl1 level`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        // 0 turns NR off; no RL1 traffic.
+        h.on("NR;", "NR0;")
+        assertTrue(c.setControl(4, 0))
+        assertEquals(1, h.writesOf("NR0;"))
+        assertTrue(h.written().all { !it.startsWith("RL1") || it == "RL1;" })
+
+        // 15 = maximum: NR1 on, RL1 level 10.
+        h.on("NR;", "NR1;")
+        h.on("RL1;", "RL110;")
+        assertTrue(c.setControl(4, 15))
+        assertEquals(1, h.writesOf("NR1;"))
+        assertEquals(1, h.writesOf("RL110;"))
+
+        // 1 = minimum audible: RL1 level 01.
+        h.on("NR;", "NR1;")
+        h.on("RL1;", "RL101;")
+        assertTrue(c.setControl(4, 1))
+        assertEquals(1, h.writesOf("RL101;"))
+
+        // The rig staying off on read-back fails the set before any RL1 write.
+        h.on("NR;", "NR0;")
+        assertFalse(c.setControl(4, 8))
+        assertEquals(0, h.writesOf("RL106;"))
+
+        assertFalse(c.setControl(4, 16))
+        c.disconnect()
+    }
+
+    @Test
+    fun `set control nb notch preamp att and filter`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        // CATCTL_NB drives NB1 on/off.
+        h.on("NB1;", "NB11;")
+        assertTrue(c.setControl(5, 1))
+        assertEquals(1, h.writesOf("NB11;"))
+        h.on("NB1;", "NB10;")
+        assertTrue(c.setControl(5, 0))
+        assertEquals(1, h.writesOf("NB10;"))
+
+        // CATCTL_NOTCH_AUTO drives the beat canceller BC0/BC1.
+        h.on("BC;", "BC1;")
+        assertTrue(c.setControl(6, 1))
+        assertEquals(1, h.writesOf("BC1;"))
+        h.on("BC;", "BC0;")
+        assertTrue(c.setControl(6, 0))
+        assertEquals(1, h.writesOf("BC0;"))
+
+        // CATCTL_PREAMP: digit-identical PA codes.
+        h.on("PA;", "PA2;")
+        assertTrue(c.setControl(8, 2))
+        assertEquals(1, h.writesOf("PA2;"))
+
+        // CATCTL_ATT: 10 dB snaps onto the 12 dB step (RA2).
+        h.on("RA;", "RA2;")
+        assertTrue(c.setControl(9, 10))
+        assertEquals(1, h.writesOf("RA2;"))
+
+        // CATCTL_FIL: app filter 2 = FL01 (B); the answer carries the
+        // 270 Hz-option digit.
+        h.on("FL0;", "FL011;")
+        assertTrue(c.setControl(1, 2))
+        assertEquals(1, h.writesOf("FL01;"))
+        // Selection C refused by the rig (two-filter menu): mismatch fails.
+        h.on("FL0;", "FL011;")
+        assertFalse(c.setControl(1, 3))
+
+        assertFalse(c.setControl(5, 2))
+        assertFalse(c.setControl(6, -1))
+        assertFalse(c.setControl(8, 3))
+        assertFalse(c.setControl(9, 61))
+        assertFalse(c.setControl(1, 0))
+        c.disconnect()
+    }
+
+    @Test
+    fun `set control filter width follows the mode ladders`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        // Session mode is USB (OM02): SL is a cut frequency there, not a
+        // width — refused without traffic.
+        assertFalse(c.setControl(12, 2400))
+        assertEquals(0, h.writesOf("SL0;"))
+
+        // In CW the SL parameter is the passband width: 500 Hz = ID 10.
+        h.on("OM0;", "OM03;")
+        assertTrue(c.setMode(3))
+        h.on("SL0;", "SL010;")
+        assertTrue(c.setControl(12, 500))
+        assertEquals(1, h.writesOf("SL010;"))
+
+        // 460 Hz snaps to the nearest rung, 450 Hz (ID 09).
+        h.on("SL0;", "SL009;")
+        assertTrue(c.setControl(12, 460))
+        assertEquals(1, h.writesOf("SL009;"))
+
+        // A mismatching read-back fails the set.
+        h.on("SL0;", "SL005;")
+        assertFalse(c.setControl(12, 100))
+        c.disconnect()
+    }
+
+    @Test
+    fun `unsupported control ids send nothing`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        // Wait for the fire-and-forget connect traffic (AI2/DD01) to flush
+        // so the write log is stable before the snapshot.
+        waitUntil { h.writesOf("DD01;") == 1 }
+        val before = h.written().size
+
+        // CATCTL_PBT_IN / CATCTL_PBT_OUT: IS is a single IF shift, not a
+        // passband-tune pair — false by design.
+        assertFalse(c.setControl(10, 128))
+        assertFalse(c.setControl(11, 128))
+        // Unknown ids likewise.
+        assertFalse(c.setControl(0, 1))
+        assertFalse(c.setControl(99, 1))
+        Thread.sleep(30)
+        assertEquals(before, h.written().size)
+        c.disconnect()
+    }
 }

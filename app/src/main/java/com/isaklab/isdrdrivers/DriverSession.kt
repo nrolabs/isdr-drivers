@@ -1065,6 +1065,16 @@ class DriverSession(
                 kenwoodCat?.setMode(m)
             }
 
+            // CAT rig: one of the rig's OWN receive controls (CATCTL_* id,
+            // value). Each dialect maps the shared id onto its wire and
+            // answers false for ids its rig has no command for.
+            DriverProto.CMD_CAT_SET_CONTROL -> {
+                val id = p.int
+                val value = p.int
+                cat?.setControl(id, value)
+                kenwoodCat?.setControl(id, value)
+            }
+
             else -> Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)}")
         }
     }

@@ -479,4 +479,140 @@ class KenwoodProtocolTest {
             P.deriveEdges(P.BandscopeMode.FIXED, 0, null, Pair(7_300_000L, 7_000_000L), false),
         )
     }
+
+    // ---- receive controls ----------------------------------------------------
+
+    @Test
+    fun `agc gc command exact ascii`() {
+        assertEquals("GC;", P.getGc())
+        assertEquals("GC0;", P.setGc(0))
+        assertEquals("GC1;", P.setGc(1))
+        assertEquals("GC2;", P.setGc(2))
+        assertEquals("GC3;", P.setGc(3))
+        // 4 (OFF-to-ON) is set-only sugar the driver never sends.
+        assertNull(P.setGc(4))
+        assertEquals(0, P.parseGc("GC0"))
+        assertEquals(3, P.parseGc("GC3"))
+        assertNull(P.parseGc("GC4"))
+        assertNull(P.parseGc("GC"))
+        assertNull(P.parseGc("GC10"))
+    }
+
+    @Test
+    fun `noise reduction nr and rl1 exact ascii`() {
+        assertEquals("NR;", P.getNr())
+        assertEquals("NR0;", P.setNr(0))
+        assertEquals("NR1;", P.setNr(1))
+        assertEquals("NR2;", P.setNr(2))
+        assertNull(P.setNr(3))
+        assertEquals(2, P.parseNr("NR2"))
+        assertNull(P.parseNr("NR3"))
+
+        assertEquals("RL1;", P.getRl1())
+        assertEquals("RL101;", P.setRl1(1))
+        assertEquals("RL110;", P.setRl1(10))
+        assertNull(P.setRl1(0))
+        assertNull(P.setRl1(11))
+        assertEquals(7, P.parseRl1("RL107"))
+        assertNull(P.parseRl1("RL100"))
+        assertNull(P.parseRl1("RL111"))
+        assertNull(P.parseRl1("RL17"))
+    }
+
+    @Test
+    fun `noise blanker nb1 exact ascii`() {
+        assertEquals("NB1;", P.getNb1())
+        assertEquals("NB10;", P.setNb1(false))
+        assertEquals("NB11;", P.setNb1(true))
+        assertEquals(false, P.parseNb1("NB10"))
+        assertEquals(true, P.parseNb1("NB11"))
+        assertNull(P.parseNb1("NB1"))
+        assertNull(P.parseNb1("NB111"))
+    }
+
+    @Test
+    fun `beat cancel bc exact ascii`() {
+        assertEquals("BC;", P.getBc())
+        assertEquals("BC0;", P.setBc(0))
+        assertEquals("BC1;", P.setBc(1))
+        assertEquals("BC2;", P.setBc(2))
+        assertNull(P.setBc(3))
+        assertEquals(1, P.parseBc("BC1"))
+        assertNull(P.parseBc("BC3"))
+    }
+
+    @Test
+    fun `preamp pa exact ascii`() {
+        assertEquals("PA;", P.getPa())
+        assertEquals("PA0;", P.setPa(0))
+        assertEquals("PA2;", P.setPa(2))
+        assertNull(P.setPa(3))
+        assertEquals(2, P.parsePa("PA2"))
+        assertNull(P.parsePa("PA3"))
+    }
+
+    @Test
+    fun `attenuator ra codes and db snapping`() {
+        assertEquals("RA;", P.getRa())
+        assertEquals("RA0;", P.setRa(0))
+        assertEquals("RA3;", P.setRa(3))
+        assertNull(P.setRa(4))
+        assertEquals(2, P.parseRa("RA2"))
+        assertNull(P.parseRa("RA4"))
+        // Steps 0/6/12/18 dB; snapping picks the nearest, ties round down.
+        assertEquals(0, P.raCodeForDb(0))
+        assertEquals(0, P.raCodeForDb(2))
+        assertEquals(1, P.raCodeForDb(6))
+        assertEquals(1, P.raCodeForDb(9))
+        assertEquals(2, P.raCodeForDb(10))
+        assertEquals(3, P.raCodeForDb(18))
+        assertEquals(3, P.raCodeForDb(40))
+    }
+
+    @Test
+    fun `receive filter fl0 exact ascii`() {
+        assertEquals("FL0;", P.getFl0())
+        assertEquals("FL00;", P.setFl0(0))
+        assertEquals("FL01;", P.setFl0(1))
+        assertEquals("FL02;", P.setFl0(2))
+        assertNull(P.setFl0(3))
+        // The answer carries the trailing 270 Hz-option digit; a bare
+        // selection digit is also accepted.
+        assertEquals(1, P.parseFl0("FL011"))
+        assertEquals(2, P.parseFl0("FL020"))
+        assertEquals(0, P.parseFl0("FL00"))
+        assertNull(P.parseFl0("FL03"))
+        assertNull(P.parseFl0("FL012x"))
+        assertNull(P.parseFl0("FL0"))
+        assertNull(P.parseFl0("FL015"))
+    }
+
+    @Test
+    fun `sl width ladders snap per mode`() {
+        assertEquals("SL0;", P.getSl0())
+        assertEquals("SL000;", P.setSl0(0))
+        assertEquals("SL018;", P.setSl0(18))
+        assertEquals("SL035;", P.setSl0(35))
+        assertNull(P.setSl0(36))
+        assertEquals(7, P.parseSl0("SL007"))
+        assertNull(P.parseSl0("SL036"))
+        assertNull(P.parseSl0("SL07"))
+
+        // CW ladder: code = index into the documented width table.
+        assertEquals(Pair(0, 50), P.slWidthCode(P.MODE_CW, 50))
+        assertEquals(Pair(10, 500), P.slWidthCode(P.MODE_CW, 510))
+        assertEquals(Pair(18, 2500), P.slWidthCode(P.MODE_CW_R, 9_000))
+        // FSK ladder.
+        assertEquals(Pair(0, 250), P.slWidthCode(P.MODE_FSK, 100))
+        assertEquals(Pair(6, 1000), P.slWidthCode(P.MODE_FSK_R, 900))
+        assertEquals(Pair(7, 1500), P.slWidthCode(P.MODE_FSK, 1500))
+        // PSK ladder.
+        assertEquals(Pair(26, 3000), P.slWidthCode(P.MODE_PSK, 3000))
+        assertEquals(Pair(16, 1200), P.slWidthCode(P.MODE_PSK_R, 1250))
+        // Modes where SL is a cut frequency (or menu-dependent) have no ladder.
+        assertNull(P.slWidthCode(P.MODE_USB, 2400))
+        assertNull(P.slWidthCode(P.MODE_AM, 6000))
+        assertNull(P.slWidthCode(P.MODE_FM, 10_000))
+        assertNull(P.slWidthCode(P.MODE_CW, 0))
+    }
 }
