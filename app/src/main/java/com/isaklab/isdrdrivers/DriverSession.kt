@@ -50,6 +50,8 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
+import java.nio.BufferUnderflowException
 import java.net.Socket
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
@@ -736,6 +738,196 @@ class DriverSession(
         send { frames.writeBool(DriverProto.EV_TX_STATE, tx) }
     }
 
+    /** Commands whose completion is the V2 EV_COMMAND_RESULT contract. */
+    private fun needsCommandResult(op: Int): Boolean = when (op) {
+        DriverProto.CMD_HELLO,
+        DriverProto.CMD_AUTH,
+        DriverProto.CMD_OPEN,
+        DriverProto.CMD_CLOSE,
+        DriverProto.CMD_SHM_ATTACH,
+        DriverProto.CMD_TX_IQ,
+        DriverProto.CMD_TX_IQ_NARROW -> false
+        else -> op in 0x10..0x7F
+    }
+
+    /**
+     * Validate the complete payload before touching hardware. A valid prefix
+     * followed by junk is malformed too; applying the prefix and complaining
+     * afterwards would leave the radio changed by a rejected command.
+     */
+    private fun controlPayloadError(op: Int, p: ByteBuffer): String? {
+        val fixed = when (op) {
+            DriverProto.CMD_HRF_START_RX,
+            DriverProto.CMD_HRF_SWEEP_STOP,
+            DriverProto.CMD_HRF_RESET,
+            DriverProto.CMD_HRF_QUERY_INFO,
+            DriverProto.CMD_HRF_QUERY_M0_STATE,
+            DriverProto.CMD_HRF_SELFTEST,
+            DriverProto.CMD_HRF_CLEAR_FREQ_EXPLICIT -> 0
+
+            DriverProto.CMD_SET_SPECTRUM_INTEREST,
+            DriverProto.CMD_SET_ANTENNA_POWER,
+            DriverProto.CMD_SET_PTT,
+            DriverProto.CMD_SET_PA_ENABLED,
+            DriverProto.CMD_HL2_SET_VNA_MODE,
+            DriverProto.CMD_HL2_SET_TR_DISABLE,
+            DriverProto.CMD_HL2_SET_PURESIGNAL,
+            DriverProto.CMD_HRF_SET_AMP,
+            DriverProto.CMD_HRF_SET_HW_SYNC,
+            DriverProto.CMD_HRF_SET_UI_ENABLE,
+            DriverProto.CMD_HRF_SET_NARROWBAND_FILTER,
+            DriverProto.CMD_HRF_SET_CLKOUT,
+            DriverProto.CMD_RTL_SET_GAIN_MODE,
+            DriverProto.CMD_RTL_SET_AGC -> 1
+
+            DriverProto.CMD_SET_FREQUENCY,
+            DriverProto.CMD_SET_TX_FREQUENCY,
+            DriverProto.CMD_SET_FREQUENCY2 -> 8
+
+            DriverProto.CMD_SET_SAMPLE_RATE,
+            DriverProto.CMD_SET_ANALOG_FILTER,
+            DriverProto.CMD_SET_TX_DRIVE,
+            DriverProto.CMD_SET_RECEIVER_COUNT,
+            DriverProto.CMD_SET_ACTIVE_RECEIVER,
+            DriverProto.CMD_SET_RX_STREAM_MASK,
+            DriverProto.CMD_HL2_SET_LNA,
+            DriverProto.CMD_HL2_SET_VNA_COUNT,
+            DriverProto.CMD_G2_SET_ATTENUATOR,
+            DriverProto.CMD_G2_SET_OC_OUTPUTS,
+            DriverProto.CMD_HRF_SET_LNA,
+            DriverProto.CMD_HRF_SET_VGA,
+            DriverProto.CMD_HRF_SET_TXVGA,
+            DriverProto.CMD_HRF_SET_LEDS,
+            DriverProto.CMD_HRF_SET_CLKIN_CTRL,
+            DriverProto.CMD_HRF_SET_P1_CTRL,
+            DriverProto.CMD_HRF_SET_P2_CTRL,
+            DriverProto.CMD_HRF_SET_TX_UNDERRUN_LIMIT,
+            DriverProto.CMD_HRF_SET_RX_OVERRUN_LIMIT,
+            DriverProto.CMD_RTL_SET_GAIN,
+            DriverProto.CMD_RTL_SET_PPM,
+            DriverProto.CMD_RTL_SET_DIRECT_SAMPLING,
+            DriverProto.CMD_CAT_SET_MODE -> 4
+
+            DriverProto.CMD_SET_TX_TIMING,
+            DriverProto.CMD_HL2_SET_FILTER_OUTPUTS,
+            DriverProto.CMD_HRF_OPERACAKE_SET_MODE,
+            DriverProto.CMD_CAT_SET_CONTROL -> 8
+
+            DriverProto.CMD_SET_SPECTRUM_ZOOM,
+            DriverProto.CMD_SET_NARROWBAND,
+            DriverProto.CMD_SET_RX_FREQUENCY,
+            DriverProto.CMD_HL2_SET_AMP_KEY,
+            DriverProto.CMD_HRF_OPERACAKE_SET_PORTS -> 12
+
+            DriverProto.CMD_HRF_SWEEP_START -> 16
+            DriverProto.CMD_HRF_SET_FREQ_EXPLICIT -> 20
+            DriverProto.CMD_HL2_SET_CW_KEYER -> 23
+            DriverProto.CMD_HL2_SET_IOBOARD,
+            DriverProto.CMD_HRF_SET_BIAS_T_OPTS -> 9
+            else -> null
+        }
+        if (fixed != null) {
+            return if (p.remaining() == fixed) null
+            else "payload length ${p.remaining()}, expected $fixed"
+        }
+        if (op == DriverProto.CMD_HRF_OPERACAKE_SET_RANGES ||
+            op == DriverProto.CMD_HRF_OPERACAKE_SET_DWELL
+        ) {
+            if (p.remaining() < 4) return "missing entry count"
+            val n = p.duplicate().int
+            val max = if (op == DriverProto.CMD_HRF_OPERACAKE_SET_RANGES) 8 else 16
+            val stride = if (op == DriverProto.CMD_HRF_OPERACAKE_SET_RANGES) 12 else 8
+            if (n !in 1..max) return "entry count $n outside 1..$max"
+            val expected = 4 + n * stride
+            if (p.remaining() != expected) {
+                return "payload length ${p.remaining()}, expected $expected for $n entries"
+            }
+            return null
+        }
+        return "unknown control opcode 0x${op.toString(16)}"
+    }
+
+    /** Refuse a control that the active adapter cannot implement. */
+    private fun supportFailure(op: Int): Pair<Int, String>? {
+        val r = radio ?: return DriverProto.COMMAND_NO_RADIO to "no radio is open"
+        val supported = when (op) {
+            DriverProto.CMD_SET_FREQUENCY,
+            DriverProto.CMD_SET_SAMPLE_RATE,
+            DriverProto.CMD_SET_SPECTRUM_INTEREST -> true
+            DriverProto.CMD_SET_ANTENNA_POWER -> r is AntennaPowerCapable
+            DriverProto.CMD_SET_ANALOG_FILTER -> r is AnalogFilterCapable
+            DriverProto.CMD_SET_SPECTRUM_ZOOM ->
+                r is Hl2Client || r is G2Client || r is RTLTCPClient ||
+                    r is RTLUSBClient || r is HackRfClient
+            // Narrowband is supplied by the station bridge, never by a radio
+            // adapter in the local driver host.
+            DriverProto.CMD_SET_NARROWBAND -> false
+            DriverProto.CMD_SET_TX_FREQUENCY,
+            DriverProto.CMD_SET_PTT -> r is TransmitCapable
+            DriverProto.CMD_SET_TX_DRIVE,
+            DriverProto.CMD_SET_PA_ENABLED -> r is TxDriveCapable
+            DriverProto.CMD_SET_TX_TIMING -> r is TxTimingCapable
+            DriverProto.CMD_SET_RECEIVER_COUNT,
+            DriverProto.CMD_SET_ACTIVE_RECEIVER,
+            DriverProto.CMD_SET_FREQUENCY2,
+            DriverProto.CMD_SET_RX_FREQUENCY,
+            DriverProto.CMD_SET_RX_STREAM_MASK -> r is Hl2Client || r is G2Client
+            DriverProto.CMD_HL2_SET_PURESIGNAL -> r is Hl2Client || r is G2Client
+            DriverProto.CMD_HL2_SET_LNA,
+            DriverProto.CMD_HL2_SET_VNA_MODE,
+            DriverProto.CMD_HL2_SET_TR_DISABLE,
+            DriverProto.CMD_HL2_SET_FILTER_OUTPUTS,
+            DriverProto.CMD_HL2_SET_AMP_KEY,
+            DriverProto.CMD_HL2_SET_VNA_COUNT,
+            DriverProto.CMD_HL2_SET_IOBOARD,
+            DriverProto.CMD_HL2_SET_CW_KEYER -> r is Hl2Client
+            DriverProto.CMD_G2_SET_ATTENUATOR,
+            DriverProto.CMD_G2_SET_OC_OUTPUTS -> r is G2Client
+            DriverProto.CMD_HRF_SET_LNA,
+            DriverProto.CMD_HRF_SET_VGA,
+            DriverProto.CMD_HRF_SET_TXVGA,
+            DriverProto.CMD_HRF_SET_AMP,
+            DriverProto.CMD_HRF_START_RX,
+            DriverProto.CMD_HRF_SWEEP_START,
+            DriverProto.CMD_HRF_SWEEP_STOP,
+            DriverProto.CMD_HRF_SET_FREQ_EXPLICIT,
+            DriverProto.CMD_HRF_SET_BIAS_T_OPTS,
+            DriverProto.CMD_HRF_SET_HW_SYNC,
+            DriverProto.CMD_HRF_SET_UI_ENABLE,
+            DriverProto.CMD_HRF_SET_LEDS,
+            DriverProto.CMD_HRF_SET_NARROWBAND_FILTER,
+            DriverProto.CMD_HRF_SET_CLKOUT,
+            DriverProto.CMD_HRF_SET_CLKIN_CTRL,
+            DriverProto.CMD_HRF_SET_P1_CTRL,
+            DriverProto.CMD_HRF_SET_P2_CTRL,
+            DriverProto.CMD_HRF_SET_TX_UNDERRUN_LIMIT,
+            DriverProto.CMD_HRF_SET_RX_OVERRUN_LIMIT,
+            DriverProto.CMD_HRF_OPERACAKE_SET_PORTS,
+            DriverProto.CMD_HRF_OPERACAKE_SET_MODE,
+            DriverProto.CMD_HRF_OPERACAKE_SET_RANGES,
+            DriverProto.CMD_HRF_OPERACAKE_SET_DWELL,
+            DriverProto.CMD_HRF_RESET,
+            DriverProto.CMD_HRF_QUERY_INFO,
+            DriverProto.CMD_HRF_QUERY_M0_STATE,
+            DriverProto.CMD_HRF_SELFTEST,
+            DriverProto.CMD_HRF_CLEAR_FREQ_EXPLICIT -> r is HackRfClient
+            DriverProto.CMD_RTL_SET_GAIN,
+            DriverProto.CMD_RTL_SET_GAIN_MODE,
+            DriverProto.CMD_RTL_SET_AGC,
+            DriverProto.CMD_RTL_SET_PPM -> r is RTLTCPClient || r is RTLUSBClient
+            DriverProto.CMD_RTL_SET_DIRECT_SAMPLING -> r is RTLTCPClient || r is RTLUSBClient
+            DriverProto.CMD_CAT_SET_MODE,
+            DriverProto.CMD_CAT_SET_CONTROL -> r is CivClient || r is KenwoodClient
+            else -> false
+        }
+        return if (supported) null
+        else DriverProto.COMMAND_UNSUPPORTED to "opcode 0x${op.toString(16)} is unsupported by ${r.javaClass.simpleName}"
+    }
+
+    private fun sendCommandResult(op: Int, disposition: Int, detail: String = "") {
+        send { frames.writeCommandResult(op, disposition, detail) }
+    }
+
     // ---- inbound dispatch ----
 
     private fun handle(frame: Frame) {
@@ -749,8 +941,21 @@ class DriverSession(
             close()
             return
         }
+        val terminal = needsCommandResult(frame.op)
+        if (terminal) {
+            controlPayloadError(frame.op, p)?.let { detail ->
+                sendCommandResult(frame.op, DriverProto.COMMAND_MALFORMED, detail)
+                return
+            }
+            supportFailure(frame.op)?.let { (disposition, detail) ->
+                sendCommandResult(frame.op, disposition, detail)
+                return
+            }
+        }
+        try {
         when (frame.op) {
             DriverProto.CMD_HELLO -> {
+                if (p.remaining() != 4) throw IOException("invalid CMD_HELLO length ${p.remaining()}")
                 val version = p.int
                 val features = DriverProto.FEAT_RX_STREAMS or
                     DriverProto.FEAT_SEQ_TAG or
@@ -758,16 +963,19 @@ class DriverSession(
                     DriverProto.FEAT_ANTENNA_SWITCH or
                     DriverProto.FEAT_CLOCK_TRIGGER or
                     DriverProto.FEAT_BOARD_DIAGNOSTICS or
+                    DriverProto.FEAT_COMMAND_RESULTS or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
                 send { frames.writeHello(DriverProto.VERSION, features) }
                 if (version != DriverProto.VERSION) {
                     Log.w(TAG, "protocol mismatch: app=$version host=${DriverProto.VERSION}")
+                    close()
                 }
             }
             DriverProto.CMD_AUTH -> {
                 val token = p.getUtf()
+                if (p.hasRemaining()) throw IOException("tail on CMD_AUTH")
                 val ok = requiredToken != null && tokensMatch(token, requiredToken)
                 if (ok) {
                     authenticated = true
@@ -786,11 +994,16 @@ class DriverSession(
                 val host = p.getUtf()
                 val port = p.int
                 val flags = p.int
+                if (p.hasRemaining()) throw IOException("tail on CMD_OPEN")
                 scope.launch { openDevice(kind, host, port, flags) }
             }
-            DriverProto.CMD_CLOSE -> closeDevice()
+            DriverProto.CMD_CLOSE -> {
+                if (p.hasRemaining()) throw IOException("payload on CMD_CLOSE")
+                closeDevice()
+            }
 
             DriverProto.CMD_SHM_ATTACH -> {
+                if (p.remaining() != 1) throw IOException("invalid CMD_SHM_ATTACH length ${p.remaining()}")
                 val want = p.getBool()
                 // Only arm once the ring exists (binder handshake done); a
                 // request without it — or a detach — leaves/returns the data
@@ -856,8 +1069,10 @@ class DriverSession(
                 (radio as? TransmitCapable)?.setTxFrequency(hz)
             }
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
-                (radio as? TransmitCapable)?.setPtt(on)
-                pttOn = on
+                val tx = radio as TransmitCapable
+                tx.setPtt(on)
+                val actual = tx.isTransmitting()
+                pttOn = actual
                 // Cleared either way: the watchdog re-arms only when transmit
                 // samples actually start flowing, so a mode that keys without
                 // a stream of its own is never cut short by it.
@@ -865,8 +1080,11 @@ class DriverSession(
                 // The key-down instant anchors the no-stream and absolute
                 // ceilings: without it a keyed radio whose client died before
                 // the first sample had NO watchdog at all.
-                if (on) keyedAtMs = android.os.SystemClock.elapsedRealtime()
+                if (actual) keyedAtMs = android.os.SystemClock.elapsedRealtime()
                 sendTxState()
+                if (actual != on) {
+                    throw IllegalStateException("PTT was not confirmed")
+                }
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
                 (radio as? TxDriveCapable)?.setTxDrive(level)
@@ -1075,7 +1293,33 @@ class DriverSession(
                 kenwoodCat?.setControl(id, value)
             }
 
-            else -> Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)}")
+            else -> {
+                Log.w(TAG, "unknown opcode 0x${frame.op.toString(16)} — closing")
+                close()
+                return
+            }
+        }
+        } catch (e: BufferUnderflowException) {
+            if (terminal) {
+                sendCommandResult(frame.op, DriverProto.COMMAND_MALFORMED, "truncated payload")
+                return
+            }
+            throw IOException("truncated payload for opcode 0x${frame.op.toString(16)}", e)
+        } catch (e: IOException) {
+            if (terminal) {
+                sendCommandResult(frame.op, DriverProto.COMMAND_MALFORMED, e.message ?: "malformed payload")
+                return
+            }
+            throw e
+        } catch (e: Exception) {
+            if (terminal) {
+                sendCommandResult(frame.op, DriverProto.COMMAND_REJECTED, e.message ?: e.javaClass.simpleName)
+                return
+            }
+            throw e
+        }
+        if (terminal) {
+            sendCommandResult(frame.op, DriverProto.COMMAND_ACCEPTED)
         }
     }
 
