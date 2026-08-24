@@ -2,6 +2,7 @@ package com.isaklab.libg2sdrk
 
 import kotlin.math.abs
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -53,13 +54,57 @@ class G2ProtocolP2Test {
     fun ddcSpecificCarriesDitherRandomAndSyncPair() {
         val st = G2Protocol.ControlState().apply {
             adcDither = 0b01; adcRandom = 0b11
-            receiverCount = 2; ddcSync01 = true
+            receiverCount = 2; diversityRoute01 = true; ddcSync01 = true
         }
         val p = G2Protocol.rxSpecificPacket(st)
         assertEquals(0b01, p[5].toInt())
         assertEquals(0b11, p[6].toInt())
         assertEquals(0b11, p[7].toInt())                              // DDC0+1 enabled
+        assertEquals(G2Protocol.DDC_INPUT_ADC0, p[17].toInt())       // RX1 -> ADC1
+        assertEquals(G2Protocol.DDC_INPUT_ADC1, p[23].toInt())       // RX2 -> ADC2
         assertEquals(0b10, p[1363].toInt())                           // sync pair 0+1
+
+        st.ddcSync01 = false
+        val routedOnly = G2Protocol.rxSpecificPacket(st)
+        assertEquals(G2Protocol.DDC_INPUT_ADC1, routedOnly[23].toInt())
+        assertEquals(0, routedOnly[1363].toInt())
+
+        st.diversityRoute01 = false
+        val neutral = G2Protocol.rxSpecificPacket(st)
+        assertEquals(G2Protocol.DDC_INPUT_ADC0, neutral[23].toInt())
+    }
+
+    @Test
+    fun invalidRoutingStateIsRejectedInsteadOfClampedOrSerialized() {
+        val excessive = G2Protocol.ControlState().apply { receiverCount = 8 }
+        assertThrows(IllegalArgumentException::class.java) {
+            G2Protocol.rxSpecificPacket(excessive)
+        }
+        assertEquals(8, excessive.receiverCount)
+
+        val missingRoute = G2Protocol.ControlState().apply {
+            receiverCount = 2
+            ddcSync01 = true
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            G2Protocol.rxSpecificPacket(missingRoute)
+        }
+
+        val unlocked = G2Protocol.ControlState().apply {
+            receiverCount = 2
+            diversityRoute01 = true
+            ddcSync01 = true
+            ddcFreqHz[1] = ddcFreqHz[0] + 1
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            G2Protocol.rxSpecificPacket(unlocked)
+        }
+
+        val invalidAntenna = G2Protocol.ControlState().apply { rxAntenna = 4 }
+        assertThrows(IllegalArgumentException::class.java) {
+            G2Protocol.highPriorityPacket(invalidAntenna)
+        }
+        assertEquals(4, invalidAntenna.rxAntenna)
     }
 
     @Test

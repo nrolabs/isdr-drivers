@@ -205,6 +205,20 @@ class CivClientTest {
     }
 
     @Test
+    fun `tx frequency refuses without retuning receive vfo`() {
+        val rig = FakeRig(echo = true)
+        scriptConnect(rig)
+        val (c, _) = makeClient(rig, RIG)
+        assertTrue(connect(c))
+        val writesBefore = rig.totalWrites()
+
+        assertFalse(c.setTxFrequency(14_250_000))
+        assertEquals(14_074_000L, c.frequencyHz())
+        assertEquals(writesBefore, rig.totalWrites())
+        c.disconnect()
+    }
+
+    @Test
     fun `request is retried until a reply lands`() {
         val rig = FakeRig(echo = true)
         scriptConnect(rig)

@@ -18,6 +18,7 @@ class HackRfClientStateTest {
         data class Ctl(val type: Int, val request: Int, val value: Int, val index: Int)
 
         val controls = mutableListOf<Ctl>()
+        val failedRequests = mutableSetOf<Int>()
         var gainStatus: Byte = 1
         var rxChunks: List<ByteArray> = emptyList()
 
@@ -26,6 +27,7 @@ class HackRfClientStateTest {
             data: ByteArray?, length: Int, timeoutMs: Int,
         ): Int {
             synchronized(controls) { controls.add(Ctl(requestType, request, value, index)) }
+            if (request in failedRequests) return -1
             if (requestType == HackRfProtocol.TYPE_VENDOR_IN && data != null && length >= 1) {
                 data.fill(0)
                 data[0] = gainStatus
@@ -73,12 +75,12 @@ class HackRfClientStateTest {
     // ---- item 3: state guards ----------------------------------------------
 
     @Test
-    fun `sample rate change is deferred while transmitting`() {
+    fun `sample rate change is rejected without deferred mutation while transmitting`() {
         val fake = FakeTransport()
         val c = client(fake)
         c.forceTransmittingForTest(true)
         fake.clear()
-        c.setSampleRate(8_000_000)
+        assertTrue(runCatching { c.setSampleRate(8_000_000) }.isFailure)
         assertFalse(fake.sent(HackRfProtocol.REQ_SAMPLE_RATE_SET))
         c.forceTransmittingForTest(false)
         c.setSampleRate(8_000_000)
@@ -86,42 +88,44 @@ class HackRfClientStateTest {
     }
 
     @Test
-    fun `sample rate change is deferred while sweeping`() {
+    fun `sample rate change is rejected while sweeping`() {
         val fake = FakeTransport()
         val c = client(fake)
         c.forceSweepingForTest(true)
         fake.clear()
-        c.setSampleRate(10_000_000)
+        assertTrue(runCatching { c.setSampleRate(10_000_000) }.isFailure)
         assertFalse(fake.sent(HackRfProtocol.REQ_SAMPLE_RATE_SET))
     }
 
     @Test
-    fun `analog filter change is deferred while transmitting or sweeping`() {
+    fun `analog filter change is rejected while transmitting or sweeping`() {
         val fake = FakeTransport()
         val c = client(fake)
         c.forceTransmittingForTest(true)
         fake.clear()
-        c.setAnalogFilterHz(1_750_000)
+        assertTrue(runCatching { c.setAnalogFilterHz(1_750_000) }.isFailure)
         assertFalse(fake.sent(HackRfProtocol.REQ_BASEBAND_FILTER_BW_SET))
         c.forceTransmittingForTest(false)
         c.forceSweepingForTest(true)
-        c.setAnalogFilterHz(1_750_000)
+        assertTrue(runCatching { c.setAnalogFilterHz(1_750_000) }.isFailure)
         assertFalse(fake.sent(HackRfProtocol.REQ_BASEBAND_FILTER_BW_SET))
         c.forceSweepingForTest(false)
         c.setAnalogFilterHz(1_750_000)
         assertTrue(fake.sent(HackRfProtocol.REQ_BASEBAND_FILTER_BW_SET))
-        // The deferred value was recorded, not lost.
+        // Only the later, actually-applied value becomes authoritative.
         assertEquals(HackRfProtocol.basebandFilterFor(1_750_000), c.basebandFilterHz())
     }
 
     @Test
-    fun `frequency change while keyed is recorded but not sent`() {
+    fun `frequency change while keyed is rejected and not recorded`() {
         val fake = FakeTransport()
         val c = client(fake)
         c.forceTransmittingForTest(true)
         fake.clear()
-        c.setFrequency(7_100_000L)
+        val before = c.frequencyHz()
+        assertTrue(runCatching { c.setFrequency(7_100_000L) }.isFailure)
         assertFalse(fake.sent(HackRfProtocol.REQ_SET_FREQ))
+        assertEquals(before, c.frequencyHz())
     }
 
     // ---- item 4: gain requests carry a status byte -------------------------
@@ -154,6 +158,48 @@ class HackRfClientStateTest {
         val c = client(fake)
         assertFalse(c.setVgaGain(20))
         assertFalse(c.setTxVgaGain(10))
+    }
+
+    @Test
+    fun `control setters reject non representable values instead of clipping`() {
+        val fake = FakeTransport()
+        val c = client(fake)
+        assertTrue(runCatching { c.setLnaGain(7) }.isFailure)
+        assertTrue(runCatching { c.setVgaGain(21) }.isFailure)
+        assertTrue(runCatching { c.setTxVgaGain(48) }.isFailure)
+        assertTrue(runCatching { c.setAnalogFilterHz(2_000_000) }.isFailure)
+        assertTrue(runCatching { c.setSampleRate(1_999_999) }.isFailure)
+        assertTrue(fake.controls.isEmpty())
+    }
+
+    @Test
+    fun `identity failures remain distinct from empty values and unsupported queries`() {
+        val failed = FakeTransport().apply {
+            failedRequests += HackRfProtocol.REQ_VERSION_STRING_READ
+            failedRequests += HackRfProtocol.REQ_BOARD_ID_READ
+            failedRequests += HackRfProtocol.REQ_BOARD_PARTID_SERIALNO_READ
+            failedRequests += HackRfProtocol.REQ_BOARD_REV_READ
+            failedRequests += HackRfProtocol.REQ_SUPPORTED_PLATFORM_READ
+        }
+        val failedClient = client(failed)
+        failedClient.readIdentityForTest(HackRfProtocol.API_SUPPORTED_PLATFORM)
+        val failedInfo = failedClient.boardInfo()
+        assertTrue(failedInfo.firmwareQueryFailed)
+        assertTrue(failedInfo.boardIdQueryFailed)
+        assertTrue(failedInfo.serialQueryFailed)
+        assertTrue(failedInfo.boardRevisionQueryFailed)
+        assertTrue(failedInfo.platformQueryFailed)
+
+        val emptyButAnsweredClient = client(FakeTransport())
+        emptyButAnsweredClient.readIdentityForTest(0)
+        val emptyButAnswered = emptyButAnsweredClient.boardInfo()
+        assertFalse(emptyButAnswered.firmwareQueryFailed)
+        assertFalse(emptyButAnswered.boardIdQueryFailed)
+        assertFalse(emptyButAnswered.serialQueryFailed)
+        // Firmware that does not advertise these requests is unsupported,
+        // not a failed physical readback.
+        assertFalse(emptyButAnswered.boardRevisionQueryFailed)
+        assertFalse(emptyButAnswered.platformQueryFailed)
     }
 
     // ---- item 1: reassembly through the production RX path -----------------

@@ -18,7 +18,7 @@ class TokenAuthTest {
         .apply { isAccessible = true }
 
     private val companion: Any = Class.forName("com.isaklab.isdrdrivers.DriverSession")
-        .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        .getDeclaredField("Companion").apply { isAccessible = true }.get(null)!!
 
     private fun eq(a: String, b: String) = match.invoke(companion, a, b) as Boolean
 

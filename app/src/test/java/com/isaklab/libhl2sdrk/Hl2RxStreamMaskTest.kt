@@ -31,7 +31,7 @@ import org.junit.Test
 
 /**
  * Per-receiver stream arming on the REAL [Hl2Client], driven by the local
- * Hermes-Lite 2 emulator.
+ * Protocol 1 emulator as an ANAN-100D (Angelia, two physical ADCs).
  *
  * A HL2 frame carries every receiver interleaved, so the second receiver's
  * samples and the active one's are decoded from the SAME frames and flushed
@@ -91,7 +91,7 @@ class Hl2RxStreamMaskTest {
         val proc = try {
             ProcessBuilder(
                 "python3", script!!.absolutePath,
-                "--port", port.toString(), "--diversity", "--quiet",
+                "--port", port.toString(), "--board", "angelia", "--diversity", "--quiet",
             ).redirectErrorStream(true).redirectOutput(File("/dev/null")).start()
         } catch (e: Exception) {
             null
@@ -147,6 +147,7 @@ class Hl2RxStreamMaskTest {
             onConnectionStatusChanged = { _, _ -> },
             onDataRx = { rx, iq -> events.add(Ev.Rx(rx, iq.size / 2, trailingSilence(iq))) },
             port = port,
+            profile = Protocol1Profile.ANAN_100D,
         )
         client = c
         c.spectrumEnabled = false

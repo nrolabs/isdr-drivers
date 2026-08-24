@@ -86,6 +86,10 @@ class Hl2IoBoardWireTest {
         onDataReceived = { _, _ -> },
         onConnectionStatusChanged = { _, _ -> },
         port = boardSocket.localPort,
+        verifiedBoard = VerifiedProtocol1Board(
+            InetAddress.getByName("127.0.0.1"),
+            Protocol1Profile.HERMES_LITE_2,
+        ),
     ).also { client = it }
 
     // ---- wire helpers -------------------------------------------------------

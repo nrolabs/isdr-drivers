@@ -19,11 +19,17 @@
 
 package com.isaklab.libg2sdrk
 
+import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.util.Collections
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -54,22 +60,97 @@ class G2LoopFailureTest {
     private val statuses = Collections.synchronizedList(ArrayList<String>())
     private val uncaught = Collections.synchronizedList(ArrayList<Throwable>())
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
+    private val discoveryResponders = ArrayList<Pair<DatagramSocket, Thread>>()
 
     @Before
     fun installHandler() {
         previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { _, t -> uncaught.add(t) }
+        listOf(portOffset, portOffset + 40, portOffset + 80).forEach(::startDiscoveryResponder)
     }
 
     @After
     fun restore() {
         client?.disconnect()
         Thread.sleep(200)
+        discoveryResponders.forEach { (socket, thread) ->
+            socket.close()
+            thread.join(1_000)
+        }
+        discoveryResponders.clear()
         Thread.setDefaultUncaughtExceptionHandler(previousHandler)
+    }
+
+    /** A minimal exact-Saturn identity; command packets after discovery are ignored. */
+    private fun startDiscoveryResponder(offset: Int) {
+        val socket = DatagramSocket(
+            G2Protocol.GENERAL_PORT + offset,
+            InetAddress.getByName("127.0.0.1"),
+        ).apply { soTimeout = 200 }
+        val thread = Thread({
+            val bytes = ByteArray(2048)
+            while (!socket.isClosed) {
+                try {
+                    val request = DatagramPacket(bytes, bytes.size)
+                    socket.receive(request)
+                    if (request.length >= 5 && bytes[4].toInt() and 0xff == 0x02) {
+                        val reply = ByteArray(60)
+                        reply[4] = 0x02
+                        reply[11] = G2Protocol.DiscoveryBoardId.SATURN.toByte()
+                        reply[12] = 39
+                        reply[13] = 27
+                        reply[20] = G2Protocol.MAX_DDC.toByte()
+                        socket.send(DatagramPacket(reply, reply.size, request.address, request.port))
+                    }
+                } catch (_: SocketTimeoutException) {
+                    // Recheck close flag.
+                } catch (_: SocketException) {
+                    if (!socket.isClosed) throw AssertionError("discovery responder failed")
+                }
+            }
+        }, "g2-test-discovery-$offset").apply {
+            isDaemon = true
+            start()
+        }
+        discoveryResponders += socket to thread
     }
 
     private fun field(name: String): Any? =
         G2Client::class.java.getDeclaredField(name).apply { isAccessible = true }.get(client!!)
+
+    @Test
+    fun terminalControlsAfterDisconnectAreRejectedWithoutLocalMutation() = runBlocking {
+        val c = G2Client(
+            host = "127.0.0.1",
+            onDataReceived = { _, _ -> },
+            onConnectionStatusChanged = { _, m -> statuses.add(m) },
+            portOffset = portOffset + 80,
+        )
+        client = c
+        c.spectrumEnabled = false
+        assertTrue("connect", c.connect())
+        val state = field("state") as G2Protocol.ControlState
+        val originalTxHz = state.txFreqHz
+
+        // disconnect() closes the command gate synchronously even though the
+        // resource teardown continues off-thread. This is the exact race
+        // between DriverSession's readiness check and an adapter call.
+        c.disconnect()
+
+        assertThrows(IllegalStateException::class.java) { c.setTxFrequency(14_200_000L) }
+        assertThrows(IllegalStateException::class.java) { c.setPtt(true) }
+        assertThrows(IllegalStateException::class.java) { c.setTxDrive(123) }
+        assertThrows(IllegalStateException::class.java) { c.setPaEnabled(true) }
+        assertThrows(IllegalStateException::class.java) { c.setStepAttenuator(17) }
+        assertThrows(IllegalStateException::class.java) { c.setOpenCollectorOutputs(0x23) }
+
+        assertEquals(originalTxHz, state.txFreqHz)
+        assertFalse(state.mox)
+        assertEquals(0, state.txDrive)
+        assertFalse(state.paEnabled)
+        assertEquals(0, state.stepAttenDb)
+        assertEquals(0, state.ocOutputs)
+    }
 
     @Test
     fun socketClosedUnderAKeyedSessionRetiresItInsteadOfLeavingAZombie() = runBlocking {

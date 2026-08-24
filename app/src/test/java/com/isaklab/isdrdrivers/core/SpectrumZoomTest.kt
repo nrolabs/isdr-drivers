@@ -113,12 +113,12 @@ class SpectrumZoomTest {
     }
 
     @Test
-    fun `the factor is clamped to what is offered`() {
+    fun `the factor is exact and never clamped`() {
         val z = SpectrumZoom()
-        z.set(0, 0.0, 48_000.0)
+        assertTrue(runCatching { z.set(0, 0.0, 48_000.0) }.isFailure)
         assertEquals(1, z.decimation)
-        z.set(4096, 0.0, 48_000.0)
-        assertEquals(SpectrumZoom.MAX_DECIMATION, z.decimation)
+        assertTrue(runCatching { z.set(4096, 0.0, 48_000.0) }.isFailure)
+        assertEquals(1, z.decimation)
     }
 
     /** A gain change with zoom would make the same signal read at a different

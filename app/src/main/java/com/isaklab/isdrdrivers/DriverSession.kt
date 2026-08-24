@@ -21,15 +21,18 @@ import com.isaklab.isdrdrivers.core.DspThread
 import com.isaklab.isdrdrivers.core.RadioClient
 import com.isaklab.isdrdrivers.core.AntennaPowerCapable
 import com.isaklab.isdrdrivers.core.AnalogFilterCapable
+import com.isaklab.isdrdrivers.core.CatControlCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrdrivers.core.TxDriveCapable
 import com.isaklab.isdrdrivers.core.TxTimingCapable
 import com.isaklab.isdrproto.Frame
 import com.isaklab.isdrproto.Frames
+import com.isaklab.isdrproto.BoardControls
 import com.isaklab.isdrproto.DriverProto
 import com.isaklab.isdrproto.IqCodec
 import com.isaklab.isdrproto.SpectrumCodec
 import com.isaklab.isdrproto.RadioTelemetry
+import com.isaklab.isdrproto.ReceiverWireContract
 import com.isaklab.isdrproto.getBool
 import com.isaklab.isdrproto.getFloats
 import com.isaklab.isdrproto.getUtf
@@ -40,11 +43,15 @@ import com.isaklab.libkenwoodk.KenwoodClient
 import com.isaklab.libg2sdrk.G2Client
 import com.isaklab.libg2sdrk.G2Protocol
 import com.isaklab.libhackrfk.HackRfClient
+import com.isaklab.libhackrfk.HackRfProtocol
 import com.isaklab.libhl2sdrk.Hl2Client
 import com.isaklab.libhl2sdrk.Hl2Protocol
+import com.isaklab.libhl2sdrk.Protocol1Profile
+import com.isaklab.libhl2sdrk.Protocol1Discovery
 import com.isaklab.librtlsdrk.RTLCommand
 import com.isaklab.librtlsdrk.RTLTCPClient
 import com.isaklab.librtlsdrk.RTLUSBClient
+import com.isaklab.librtlsdrk.RtlTunerInfo
 import java.nio.ByteBuffer
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -59,6 +66,71 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+
+/**
+ * Build the append-only EV_HRF_INFO failure word. Unsupported diagnostics do
+ * not count as failed queries; the supported-controls contract describes
+ * availability independently.
+ */
+internal fun hackRfInfoQueryFailedMask(
+    firmwareQueryFailed: Boolean,
+    boardIdQueryFailed: Boolean,
+    serialQueryFailed: Boolean,
+    boardRevisionQueryFailed: Boolean,
+    platformQueryFailed: Boolean,
+    supportsClkinQuery: Boolean,
+    clkinResult: Boolean?,
+    supportsOperaCakeQuery: Boolean,
+    boardsResult: IntArray?,
+    supportsCpldQuery: Boolean,
+    cpldResult: Long?,
+    modeResult: Int?,
+): Int {
+    var mask = 0
+    if (firmwareQueryFailed) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_FIRMWARE
+    }
+    if (boardIdQueryFailed) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_BOARD_ID
+    }
+    if (serialQueryFailed) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_SERIAL
+    }
+    if (boardRevisionQueryFailed) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_BOARD_REVISION
+    }
+    if (platformQueryFailed) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_PLATFORM
+    }
+    if (supportsClkinQuery && clkinResult == null) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_CLKIN
+    }
+    if (supportsOperaCakeQuery && boardsResult == null) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_OPERACAKE_BOARDS
+    }
+    if (supportsCpldQuery && cpldResult == null) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_CPLD_CHECKSUM
+    }
+    if (boardsResult?.isNotEmpty() == true && modeResult == null) {
+        mask = mask or DriverProto.HRF_INFO_QUERY_FAILED_OPERACAKE_MODE
+    }
+    return mask
+}
+
+/** Canonical EV_RTL_INFO encoder shared with byte-parity tests. */
+internal fun encodeRtlInfo(info: RtlTunerInfo): ByteBuffer {
+    val name = info.tunerName.toByteArray(Charsets.UTF_8)
+    val gains = info.gainsTenthsDb
+    return ByteBuffer.allocate(4 + 2 + name.size + 1 + 4 + gains.size * 4).apply {
+        putInt(info.tunerType)
+        putShort(name.size.toShort())
+        put(name)
+        put(if (info.gainTableKnown) 1 else 0)
+        putInt(gains.size)
+        gains.forEach { putInt(it) }
+        flip()
+    }
+}
 
 /**
  * One app connection: commands in, driver data/status/telemetry out. Holds at
@@ -156,6 +228,25 @@ class DriverSession(
      * specific to one radio; everything common goes through this one.
      */
     @Volatile private var radio: RadioClient? = null
+    /**
+     * A retained adapter object is not proof that its transport is alive.
+     * Every terminal command is refused once the current-generation client
+     * reports disconnect, so an adapter's best-effort/no-session path can
+     * never be promoted to COMMAND_ACCEPTED.
+     */
+    @Volatile private var radioControlReady = false
+
+    /** Authoritative receiver leaf state used to reject, never normalise, a transition. */
+    @Volatile private var receiverCount = 1
+    /** Exact physical/profile ceiling derived from the accepted OPEN identity. */
+    @Volatile private var receiverCapacity = 1
+    @Volatile private var activeReceiver = 0
+    @Volatile private var rxStreamMask = 0
+    /** Confirmed semantic diversity state; never inferred from [rxStreamMask]. */
+    @Volatile private var diversitySupported = false
+    @Volatile private var diversityEnabled = false
+    @Volatile private var diversityReference = 0
+    @Volatile private var diversityMemberMask = 0
 
     private val frames = Frames(
         DataInputStream(BufferedInputStream(socket.getInputStream(), 64 * 1024)),
@@ -446,6 +537,8 @@ class DriverSession(
     // This is deliberately in the driver host: it is the last process that
     // still holds the radio, and it protects regardless of how the link died.
     @Volatile private var pttOn = false
+    /** False after an unconfirmed TX tune; key-down then fails closed. */
+    @Volatile private var txFrequencyReady = true
     @Volatile private var lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
 
     /** Monotonic instant of the last key-down (for the no-stream ceilings). */
@@ -558,7 +651,10 @@ class DriverSession(
 
     /** [onStatus] gated on the client generation it was created for. */
     private fun statusFor(gen: Int): (Boolean, String) -> Unit = { connected, status ->
-        if (gen == clientGen.get()) onStatus(connected, status)
+        if (gen == clientGen.get()) {
+            radioControlReady = connected
+            onStatus(connected, status)
+        }
     }
 
     /**
@@ -604,14 +700,30 @@ class DriverSession(
 
     private fun sendHackRfInfoBlocking(hrf: HackRfClient) {
         val info = hrf.boardInfo()
-        val boards = hrf.operacakeBoards()
-        val clkin = hrf.clkinStatus()
-        val cpld = hrf.cpldChecksum()
+        val clkinResult = hrf.tryClkinStatus()
+        val boardsResult = hrf.tryOperacakeBoards()
+        val boards = boardsResult ?: IntArray(0)
+        val cpldResult = hrf.tryCpldChecksum()
+        val modeResult = boards.firstOrNull()?.let(hrf::tryOperacakeGetMode)
+        val queryFailedMask = hackRfInfoQueryFailedMask(
+            firmwareQueryFailed = info.firmwareQueryFailed,
+            boardIdQueryFailed = info.boardIdQueryFailed,
+            serialQueryFailed = info.serialQueryFailed,
+            boardRevisionQueryFailed = info.boardRevisionQueryFailed,
+            platformQueryFailed = info.platformQueryFailed,
+            supportsClkinQuery = hrf.supportsApi(HackRfProtocol.API_CLKIN_STATUS),
+            clkinResult = clkinResult,
+            supportsOperaCakeQuery = hrf.supportsApi(HackRfProtocol.API_OPERACAKE_MODE),
+            boardsResult = boardsResult,
+            supportsCpldQuery = hrf.supportsApi(HackRfProtocol.API_CPLD_CHECKSUM),
+            cpldResult = cpldResult,
+            modeResult = modeResult,
+        )
         val strings = listOf(
             info.boardName, info.revisionName, info.platformName,
             info.firmwareVersion, info.usbApiName, info.serialNumber,
         )
-        val cap = 4 + 4 + 1 + 4 + 4 + 1 + 4 + boards.size * 4 + 8 + 1 + 4 + 1 + 4 + 4 +
+        val cap = 4 + 4 + 1 + 4 + 4 + 1 + 4 + boards.size * 4 + 8 + 1 + 4 + 1 + 4 + 4 + 4 +
             strings.sumOf { 2 + it.toByteArray(Charsets.UTF_8).size }
         val bb = ByteBuffer.allocate(cap)
         bb.putInt(info.boardId)
@@ -625,15 +737,16 @@ class DriverSession(
         bb.putInt(info.usbApiVersion)
         bb.putUtf(info.usbApiName)
         bb.putUtf(info.serialNumber)
-        bb.put(if (clkin) 1 else 0)
+        bb.put(if (clkinResult == true) 1 else 0)
         bb.putInt(boards.size)
         boards.forEach { bb.putInt(it) }
-        bb.putLong(cpld)
+        bb.putLong(cpldResult ?: -1L)
         bb.put(if (info.revisionKnown) 1 else 0)
         bb.putInt(hrf.basebandFilterHz())
         bb.put(if (hrf.hasExplicitTuning()) 1 else 0)
-        bb.putInt(boards.firstOrNull()?.let { hrf.operacakeGetMode(it) } ?: -1)
+        bb.putInt(modeResult ?: -1)
         bb.putInt(hrf.supportedControls())
+        bb.putInt(queryFailedMask)
         bb.flip()
         send { frames.write(DriverProto.EV_HRF_INFO, bb) }
     }
@@ -763,7 +876,8 @@ class DriverSession(
             DriverProto.CMD_HRF_QUERY_INFO,
             DriverProto.CMD_HRF_QUERY_M0_STATE,
             DriverProto.CMD_HRF_SELFTEST,
-            DriverProto.CMD_HRF_CLEAR_FREQ_EXPLICIT -> 0
+            DriverProto.CMD_HRF_CLEAR_FREQ_EXPLICIT,
+            DriverProto.CMD_RTL_QUERY_INFO -> 0
 
             DriverProto.CMD_SET_SPECTRUM_INTEREST,
             DriverProto.CMD_SET_ANTENNA_POWER,
@@ -823,7 +937,8 @@ class DriverSession(
             DriverProto.CMD_HRF_SET_FREQ_EXPLICIT -> 20
             DriverProto.CMD_HL2_SET_CW_KEYER -> 23
             DriverProto.CMD_HL2_SET_IOBOARD,
-            DriverProto.CMD_HRF_SET_BIAS_T_OPTS -> 9
+            DriverProto.CMD_HRF_SET_BIAS_T_OPTS,
+            DriverProto.CMD_SET_DIVERSITY -> 9
             else -> null
         }
         if (fixed != null) {
@@ -850,6 +965,9 @@ class DriverSession(
     /** Refuse a control that the active adapter cannot implement. */
     private fun supportFailure(op: Int): Pair<Int, String>? {
         val r = radio ?: return DriverProto.COMMAND_NO_RADIO to "no radio is open"
+        if (!radioControlReady) {
+            return DriverProto.COMMAND_NO_RADIO to "radio control transport is not connected"
+        }
         val supported = when (op) {
             DriverProto.CMD_SET_FREQUENCY,
             DriverProto.CMD_SET_SAMPLE_RATE,
@@ -869,10 +987,15 @@ class DriverSession(
             DriverProto.CMD_SET_TX_TIMING -> r is TxTimingCapable
             DriverProto.CMD_SET_RECEIVER_COUNT,
             DriverProto.CMD_SET_ACTIVE_RECEIVER,
-            DriverProto.CMD_SET_FREQUENCY2,
             DriverProto.CMD_SET_RX_FREQUENCY,
             DriverProto.CMD_SET_RX_STREAM_MASK -> r is Hl2Client || r is G2Client
-            DriverProto.CMD_HL2_SET_PURESIGNAL -> r is Hl2Client || r is G2Client
+            DriverProto.CMD_SET_DIVERSITY ->
+                (r is Hl2Client && r.supportsDiversity()) || r is G2Client
+            // Superseded by the indexed command. Keeping two leaf grammars
+            // lets an old caller bypass the atomic ReceiverControlContract.
+            DriverProto.CMD_SET_FREQUENCY2 -> false
+            DriverProto.CMD_HL2_SET_PURESIGNAL ->
+                (r is Hl2Client && r.supportsPureSignal()) || r is G2Client
             DriverProto.CMD_HL2_SET_LNA,
             DriverProto.CMD_HL2_SET_VNA_MODE,
             DriverProto.CMD_HL2_SET_TR_DISABLE,
@@ -914,14 +1037,47 @@ class DriverSession(
             DriverProto.CMD_RTL_SET_GAIN,
             DriverProto.CMD_RTL_SET_GAIN_MODE,
             DriverProto.CMD_RTL_SET_AGC,
-            DriverProto.CMD_RTL_SET_PPM -> r is RTLTCPClient || r is RTLUSBClient
+            DriverProto.CMD_RTL_SET_PPM,
+            DriverProto.CMD_RTL_QUERY_INFO -> r is RTLTCPClient || r is RTLUSBClient
             DriverProto.CMD_RTL_SET_DIRECT_SAMPLING -> r is RTLTCPClient || r is RTLUSBClient
             DriverProto.CMD_CAT_SET_MODE,
-            DriverProto.CMD_CAT_SET_CONTROL -> r is CivClient || r is KenwoodClient
+            DriverProto.CMD_CAT_SET_CONTROL -> r is CatControlCapable
             else -> false
         }
-        return if (supported) null
-        else DriverProto.COMMAND_UNSUPPORTED to "opcode 0x${op.toString(16)} is unsupported by ${r.javaClass.simpleName}"
+        if (!supported) {
+            return DriverProto.COMMAND_UNSUPPORTED to
+                "opcode 0x${op.toString(16)} is unsupported by ${r.javaClass.simpleName}"
+        }
+        if (r is HackRfClient) {
+            val requiredControl = when (op) {
+                DriverProto.CMD_HRF_SET_BIAS_T_OPTS -> BoardControls.ANTENNA_POWER_PER_MODE
+                DriverProto.CMD_HRF_SET_HW_SYNC -> BoardControls.HARDWARE_SYNC
+                DriverProto.CMD_HRF_SET_UI_ENABLE -> BoardControls.BOARD_UI
+                DriverProto.CMD_HRF_SET_LEDS -> BoardControls.PANEL_LEDS
+                DriverProto.CMD_HRF_SET_NARROWBAND_FILTER -> BoardControls.NARROWBAND_FILTER
+                DriverProto.CMD_HRF_SET_CLKOUT -> BoardControls.CLOCK_OUTPUT
+                DriverProto.CMD_HRF_SET_CLKIN_CTRL,
+                DriverProto.CMD_HRF_SET_P1_CTRL,
+                DriverProto.CMD_HRF_SET_P2_CTRL -> BoardControls.CLOCK_INPUT_SELECT
+                DriverProto.CMD_HRF_SET_TX_UNDERRUN_LIMIT,
+                DriverProto.CMD_HRF_SET_RX_OVERRUN_LIMIT -> BoardControls.WATCHDOG_LIMITS
+                DriverProto.CMD_HRF_OPERACAKE_SET_PORTS -> BoardControls.ANTENNA_SWITCH_PORTS
+                DriverProto.CMD_HRF_OPERACAKE_SET_MODE -> BoardControls.ANTENNA_SWITCH_MODE
+                DriverProto.CMD_HRF_OPERACAKE_SET_RANGES,
+                DriverProto.CMD_HRF_OPERACAKE_SET_DWELL -> BoardControls.ANTENNA_SWITCH_TABLES
+                DriverProto.CMD_HRF_RESET -> BoardControls.RESET
+                DriverProto.CMD_HRF_QUERY_M0_STATE -> BoardControls.STREAM_COUNTERS
+                DriverProto.CMD_HRF_SELFTEST -> BoardControls.SELF_TEST
+                else -> 0
+            }
+            if (requiredControl != 0 &&
+                !BoardControls.supports(r.supportedControls(), requiredControl)
+            ) {
+                return DriverProto.COMMAND_UNSUPPORTED to
+                    "HackRF did not advertise board control 0x${requiredControl.toString(16)}"
+            }
+        }
+        return null
     }
 
     private fun sendCommandResult(op: Int, disposition: Int, detail: String = "") {
@@ -959,11 +1115,14 @@ class DriverSession(
                 val version = p.int
                 val features = DriverProto.FEAT_RX_STREAMS or
                     DriverProto.FEAT_SEQ_TAG or
+                    DriverProto.FEAT_HPSDR_EXACT_PROFILE or
+                    DriverProto.FEAT_RX_ADC_ROUTING or
                     DriverProto.FEAT_RF_PATH_CONTROL or
                     DriverProto.FEAT_ANTENNA_SWITCH or
                     DriverProto.FEAT_CLOCK_TRIGGER or
                     DriverProto.FEAT_BOARD_DIAGNOSTICS or
                     DriverProto.FEAT_COMMAND_RESULTS or
+                    DriverProto.FEAT_RTL_GAIN_TABLE or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -1066,9 +1225,21 @@ class DriverSession(
 
             // TX
             DriverProto.CMD_SET_TX_FREQUENCY -> p.long.let { hz ->
-                (radio as? TransmitCapable)?.setTxFrequency(hz)
+                // Clear first: an exception or a false result must not leave
+                // a previous successful tune authorizing the following PTT.
+                txFrequencyReady = false
+                val applied = (radio as TransmitCapable).setTxFrequency(hz)
+                if (!applied) {
+                    throw IllegalStateException(
+                        "TX frequency was not confirmed without changing RX",
+                    )
+                }
+                txFrequencyReady = true
             }
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
+                if (on && !txFrequencyReady) {
+                    throw IllegalStateException("PTT blocked after an unconfirmed TX frequency")
+                }
                 val tx = radio as TransmitCapable
                 tx.setPtt(on)
                 val actual = tx.isTransmitting()
@@ -1110,12 +1281,36 @@ class DriverSession(
             // Multi-receiver
 
             DriverProto.CMD_SET_RECEIVER_COUNT -> p.int.let { n ->
+                if (n !in 1..receiverCapacity) {
+                    throw IllegalArgumentException(
+                        "receiver count $n exceeds opened profile capacity $receiverCapacity",
+                    )
+                }
+                ReceiverWireContract.countError(activeReceiver, rxStreamMask, n)?.let {
+                    throw IllegalArgumentException(it)
+                }
+                if (diversityEnabled && n < 2) {
+                    throw IllegalArgumentException(
+                        "receiver count $n would remove the active diversity pair",
+                    )
+                }
                 hl2?.setReceiverCount(n)
                 g2?.setReceiverCount(n)
+                receiverCount = n
             }
             DriverProto.CMD_SET_ACTIVE_RECEIVER -> p.int.let { i ->
+                ReceiverWireContract.activeReceiverError(receiverCount, rxStreamMask, i)?.let {
+                    throw IllegalArgumentException(it)
+                }
+                if (diversityEnabled && i != diversityReference) {
+                    throw IllegalArgumentException(
+                        "disable diversity before changing its reference receiver",
+                    )
+                }
                 hl2?.setActiveReceiver(i)
                 g2?.setActiveReceiver(i)
+                activeReceiver = i
+                if (!diversityEnabled) diversityReference = i
             }
             DriverProto.CMD_SET_FREQUENCY2 -> p.long.let { hz ->
                 hl2?.setFrequency2(hz)
@@ -1124,12 +1319,58 @@ class DriverSession(
             DriverProto.CMD_SET_RX_FREQUENCY -> {
                 val idx = p.int
                 val hz = p.long
+                ReceiverWireContract.receiverIndexError(receiverCount, idx)?.let {
+                    throw IllegalArgumentException(it)
+                }
                 hl2?.setRxFrequency(idx, hz)
                 g2?.setRxFrequency(idx, hz)
             }
             DriverProto.CMD_SET_RX_STREAM_MASK -> p.int.let { mask ->
+                ReceiverWireContract.streamMaskError(receiverCount, activeReceiver, mask)?.let {
+                    throw IllegalArgumentException(it)
+                }
                 hl2?.setRxStreamMask(mask)
                 g2?.setRxStreamMask(mask)
+                rxStreamMask = mask
+            }
+            DriverProto.CMD_SET_DIVERSITY -> {
+                val enabled = p.getBool()
+                val reference = p.int
+                val members = p.int
+                if (reference != activeReceiver) {
+                    throw IllegalArgumentException(
+                        "diversity reference $reference is not active receiver $activeReceiver",
+                    )
+                }
+                val allowed = (1 shl receiverCount) - 1
+                if (members < 0 || members and allowed.inv() != 0) {
+                    throw IllegalArgumentException(
+                        "diversity mask 0x${members.toString(16)} exceeds 0x${allowed.toString(16)}",
+                    )
+                }
+                if (members and (1 shl reference) != 0) {
+                    throw IllegalArgumentException("diversity mask contains its reference receiver")
+                }
+                if (enabled) {
+                    if (!diversitySupported) {
+                        throw IllegalArgumentException("opened radio profile has no proven diversity route")
+                    }
+                    if (members == 0) {
+                        throw IllegalArgumentException("enabled diversity requires a member receiver")
+                    }
+                    if (reference != 0 || members != 0b10) {
+                        throw IllegalArgumentException(
+                            "current HPSDR codecs support only reference=0/memberMask=0b10",
+                        )
+                    }
+                } else if (members != 0) {
+                    throw IllegalArgumentException("disabled diversity must use memberMask=0")
+                }
+                hl2?.setDiversity(enabled, reference, members)
+                g2?.setDiversity(enabled, reference, members)
+                diversityEnabled = enabled
+                diversityReference = reference
+                diversityMemberMask = if (enabled) members else 0
             }
 
             // HL2
@@ -1138,9 +1379,7 @@ class DriverSession(
             DriverProto.CMD_HL2_SET_TR_DISABLE -> hl2?.setTrDisable(p.getBool())
             DriverProto.CMD_HL2_SET_FILTER_OUTPUTS -> {
                 val rx = p.int
-                // v2 payload carries the TX word; tolerate a v1 single-int
-                // frame during a mismatched-update window.
-                val tx = if (p.remaining() >= 4) p.int else -1
+                val tx = p.int
                 hl2?.setOpenCollectorOutputs(rx, tx)
             }
             DriverProto.CMD_HL2_SET_VNA_COUNT -> hl2?.setVnaCount(p.int)
@@ -1176,25 +1415,54 @@ class DriverSession(
 
             // HackRF
             DriverProto.CMD_HRF_SET_LNA -> hackRf?.setLnaGain(p.int)
-            DriverProto.CMD_HRF_SET_VGA -> hackRf?.setVgaGain(p.int)
-            DriverProto.CMD_HRF_SET_TXVGA -> hackRf?.setTxVgaGain(p.int)
+            DriverProto.CMD_HRF_SET_VGA -> {
+                val db = p.int
+                if (hackRf?.setVgaGain(db) != true) {
+                    throw IllegalStateException("HackRF firmware refused VGA gain $db dB")
+                }
+            }
+            DriverProto.CMD_HRF_SET_TXVGA -> {
+                val db = p.int
+                if (hackRf?.setTxVgaGain(db) != true) {
+                    throw IllegalStateException("HackRF firmware refused TX VGA gain $db dB")
+                }
+            }
             DriverProto.CMD_HRF_SET_AMP -> hackRf?.setAmpEnable(p.getBool())
-            DriverProto.CMD_HRF_START_RX -> hackRf?.startRx()
+            DriverProto.CMD_HRF_START_RX -> {
+                if (hackRf?.startRx() != true) {
+                    throw IllegalStateException("HackRF RX could not start in the current state")
+                }
+            }
             DriverProto.CMD_HRF_SWEEP_START -> {
                 val startMHz = p.int
                 val stopMHz = p.int
                 val rateHz = p.int
                 val stepHz = p.int
-                hackRf?.startSweep(startMHz, stopMHz, rateHz, stepHz, ::onSweepBlock)
+                if (hackRf?.startSweep(
+                        startMHz,
+                        stopMHz,
+                        rateHz,
+                        stepHz,
+                        ::onSweepBlock,
+                    ) != true
+                ) {
+                    throw IllegalStateException("HackRF sweep could not start in the current state")
+                }
             }
-            DriverProto.CMD_HRF_SWEEP_STOP -> hackRf?.stopSweep()
+            DriverProto.CMD_HRF_SWEEP_STOP -> {
+                if (hackRf?.stopSweep() != true) {
+                    throw IllegalStateException("HackRF sweep could not stop cleanly")
+                }
+            }
 
             // HackRF, second block: the rest of what the board can be told.
             DriverProto.CMD_HRF_SET_FREQ_EXPLICIT -> {
                 val ifHz = p.long
                 val loHz = p.long
                 val path = p.int
-                hackRf?.setFreqExplicit(ifHz, loHz, path)
+                if (hackRf?.setFreqExplicit(ifHz, loHz, path) != true) {
+                    throw IllegalArgumentException("HackRF explicit tuning values were refused")
+                }
             }
             DriverProto.CMD_HRF_SET_BIAS_T_OPTS -> {
                 // Decoded into plain wire values and handed over as such. The
@@ -1227,23 +1495,31 @@ class DriverSession(
                 val addr = p.int
                 val portA = p.int
                 val portB = p.int
-                hackRf?.operacakeSetPorts(addr, portA, portB)
+                if (hackRf?.operacakeSetPorts(addr, portA, portB) != true) {
+                    throw IllegalArgumentException("Opera Cake port selection was refused")
+                }
             }
             DriverProto.CMD_HRF_OPERACAKE_SET_MODE -> {
                 val addr = p.int
-                hackRf?.operacakeSetMode(addr, p.int)
+                if (hackRf?.operacakeSetMode(addr, p.int) != true) {
+                    throw IllegalArgumentException("Opera Cake mode was refused")
+                }
             }
             DriverProto.CMD_HRF_OPERACAKE_SET_RANGES -> {
                 val n = p.int
-                val ranges = ArrayList<Triple<Int, Int, Int>>(n.coerceIn(0, 8))
-                repeat(n.coerceIn(0, 8)) { ranges.add(Triple(p.int, p.int, p.int)) }
-                if (ranges.isNotEmpty()) hackRf?.operacakeSetFreqRanges(ranges)
+                val ranges = ArrayList<Triple<Int, Int, Int>>(n)
+                repeat(n) { ranges.add(Triple(p.int, p.int, p.int)) }
+                if (hackRf?.operacakeSetFreqRanges(ranges) != true) {
+                    throw IllegalArgumentException("Opera Cake frequency table was refused")
+                }
             }
             DriverProto.CMD_HRF_OPERACAKE_SET_DWELL -> {
                 val n = p.int
-                val dwells = ArrayList<Pair<Int, Int>>(n.coerceIn(0, 16))
-                repeat(n.coerceIn(0, 16)) { dwells.add(Pair(p.int, p.int)) }
-                if (dwells.isNotEmpty()) hackRf?.operacakeSetDwellTimes(dwells)
+                val dwells = ArrayList<Pair<Int, Int>>(n)
+                repeat(n) { dwells.add(Pair(p.int, p.int)) }
+                if (hackRf?.operacakeSetDwellTimes(dwells) != true) {
+                    throw IllegalArgumentException("Opera Cake dwell table was refused")
+                }
             }
             DriverProto.CMD_HRF_RESET -> hackRf?.reset()
             DriverProto.CMD_HRF_QUERY_INFO -> sendHackRfInfo()
@@ -1254,7 +1530,7 @@ class DriverSession(
             // RTL tuner
             DriverProto.CMD_RTL_SET_GAIN -> p.int.let { g ->
                 rtlTcp?.setGain(g)
-                rtlUsb?.sendCommand(RTLCommand.SetGain(g))
+                rtlUsb?.setGain(g)
             }
             DriverProto.CMD_RTL_SET_GAIN_MODE -> p.getBool().let { manual ->
                 rtlTcp?.setGainMode(manual)
@@ -1266,8 +1542,10 @@ class DriverSession(
             }
             DriverProto.CMD_RTL_SET_PPM -> p.int.let { ppm ->
                 rtlTcp?.setFrequencyCorrection(ppm)
-                rtlUsb?.sendCommand(RTLCommand.SetPPMCorrection(ppm))
+                rtlUsb?.setFrequencyCorrection(ppm)
             }
+
+            DriverProto.CMD_RTL_QUERY_INFO -> sendRtlInfo()
 
             DriverProto.CMD_RTL_SET_DIRECT_SAMPLING -> p.int.let { mode ->
                 rtlUsb?.setDirectSamplingMode(mode)
@@ -1279,8 +1557,11 @@ class DriverSession(
             // rig switches its demodulator and passband — there is no local
             // demodulation to configure for a spectrum-only radio).
             DriverProto.CMD_CAT_SET_MODE -> p.int.let { m ->
-                cat?.setMode(m)
-                kenwoodCat?.setMode(m)
+                val r = radio as CatControlCapable
+                val applied = r.setCatMode(m)
+                val actual = r.currentCatMode()
+                send { frames.writeCatModeResult(m, actual, applied) }
+                if (!applied) throw IllegalStateException("CAT mode was not confirmed")
             }
 
             // CAT rig: one of the rig's OWN receive controls (CATCTL_* id,
@@ -1289,8 +1570,9 @@ class DriverSession(
             DriverProto.CMD_CAT_SET_CONTROL -> {
                 val id = p.int
                 val value = p.int
-                cat?.setControl(id, value)
-                kenwoodCat?.setControl(id, value)
+                val applied = (radio as CatControlCapable).setCatControl(id, value)
+                send { frames.writeCatControlResult(id, value, applied, superseded = false) }
+                if (!applied) throw IllegalStateException("CAT control was not confirmed")
             }
 
             else -> {
@@ -1324,6 +1606,48 @@ class DriverSession(
     }
 
     private suspend fun openDevice(kind: Int, host: String, port: Int, flags: Int) {
+        // Validate identity before close/claim/client allocation. In
+        // particular flags=1 is the retired "some classic ANAN" alias and may
+        // not disturb an existing session or emit control bytes to hardware.
+        val protocol1Profile = if (kind == DriverProto.DEV_HPSDR_P1) {
+            Protocol1Profile.fromOpenFlags(flags)
+        } else {
+            null
+        }
+        if (kind == DriverProto.DEV_HPSDR_P1 && protocol1Profile == null) {
+            onStatus(
+                false,
+                "Ambiguous/unknown Protocol-1 profile flags $flags; choose an exact chassis",
+            )
+            send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
+            return
+        }
+        // Read-only discovery preflight happens before closeDevice/claimDevice:
+        // a wrong board id or dead selected chassis must not disturb the radio
+        // this session already owns, much less emit start/control frames to the
+        // mismatched address.
+        val verifiedProtocol1Board = if (protocol1Profile != null) {
+            onStatus(false, "Discovering ${protocol1Profile.displayName}…")
+            val targetHost = host.ifEmpty { Hl2Client.BROADCAST }
+            val targetPort = if (port > 0) port else Hl2Protocol.PORT
+            val verified = try {
+                Protocol1Discovery.find(protocol1Profile, targetHost, targetPort)
+            } catch (e: Exception) {
+                Log.e(TAG, "Protocol-1 discovery preflight failed: ${e.message}")
+                null
+            }
+            if (verified == null) {
+                onStatus(
+                    false,
+                    "No matching ${protocol1Profile.displayName} board family answered discovery",
+                )
+                send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
+                return
+            }
+            verified
+        } else {
+            null
+        }
         closeDevice()
         // One radio, one session. Reconnection races left a ZOMBIE session
         // holding the same board — both threads fed it, with independent TX
@@ -1335,6 +1659,7 @@ class DriverSession(
         // (its disconnect is asynchronous) are filtered from here on, so its
         // late "Disconnected" can never shadow this client's "Connected".
         val gen = clientGen.incrementAndGet()
+        radioControlReady = false
         val onStatusGen = statusFor(gen)
         DriverServiceState.update { it.copy(radio = radioName(kind, flags)) }
         val ok = try {
@@ -1377,7 +1702,10 @@ class DriverSession(
                     //     true
                     // }
                 }
-                DriverProto.DEV_HL2 -> {
+                DriverProto.DEV_HPSDR_P1 -> {
+                    val profile = checkNotNull(protocol1Profile)
+                    receiverCapacity = profile.receiverCapacity
+                    diversitySupported = profile.diversitySupported
                     val c = Hl2Client(
                         host = host.ifEmpty { Hl2Client.BROADCAST },
                         onDataReceived = ::onData,
@@ -1385,13 +1713,16 @@ class DriverSession(
                         onDataRx = ::onDataRx,
                         onTelemetry = ::onHl2Telemetry,
                         port = if (port > 0) port else Hl2Protocol.PORT,
-                        classicBoard = flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0,
+                        profile = profile,
+                        verifiedBoard = checkNotNull(verifiedProtocol1Board),
                     )
                     hl2 = c
                     radio = c
                     c.connect()
                 }
                 DriverProto.DEV_G2 -> {
+                    receiverCapacity = 7
+                    diversitySupported = true
                     val c = G2Client(
                         host = host.ifEmpty { G2Client.BROADCAST },
                         onDataReceived = ::onData,
@@ -1519,7 +1850,16 @@ class DriverSession(
             }
             announceSampleRate()
             announceFrequency()
+            if (rtlTcp != null || rtlUsb != null) sendRtlInfo()
         }
+    }
+
+    /** Exact tuner/gain metadata; an unknown table is encoded as known=0,n=0. */
+    private fun sendRtlInfo() {
+        val info = rtlTcp?.tunerInfo() ?: rtlUsb?.tunerInfo()
+            ?: throw IllegalStateException("no RTL radio is open")
+        val bb = encodeRtlInfo(info)
+        send { frames.write(DriverProto.EV_RTL_INFO, bb) }
     }
 
     /** EV_FREQUENCY with the frequency in force; zero (cannot say) is never announced. */
@@ -1539,9 +1879,8 @@ class DriverSession(
         DriverProto.DEV_RTL_USB -> "RTL-SDR (USB)"
         DriverProto.DEV_HACKRF -> "HackRF"
         DriverProto.DEV_FLEX -> "FlexRadio"
-        DriverProto.DEV_HL2 ->
-            if (flags and DriverProto.OPEN_FLAG_CLASSIC_BOARD != 0) "ANAN (Protocol 1)"
-            else "Hermes-Lite 2"
+        DriverProto.DEV_HPSDR_P1 ->
+            Protocol1Profile.fromOpenFlags(flags)?.displayName ?: "Invalid Protocol-1 profile"
         DriverProto.DEV_G2 -> "ANAN-G2 (Saturn)"
         DriverProto.DEV_CAT ->
             if (DriverProto.catDialect(flags) == DriverProto.CAT_DIALECT_KENWOOD) "Kenwood"
@@ -1579,6 +1918,16 @@ class DriverSession(
         } catch (_: Exception) {
         }
         radio = null
+        radioControlReady = false
+        receiverCount = 1
+        receiverCapacity = 1
+        activeReceiver = 0
+        rxStreamMask = 0
+        diversitySupported = false
+        diversityEnabled = false
+        diversityReference = 0
+        diversityMemberMask = 0
+        txFrequencyReady = true
         rtlTcp = null
         rtlUsb = null
         hackRf = null

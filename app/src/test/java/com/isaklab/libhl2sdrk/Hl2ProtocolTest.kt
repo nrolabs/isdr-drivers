@@ -1,6 +1,7 @@
 package com.isaklab.libhl2sdrk
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import kotlin.math.PI
 import kotlin.math.atan2
@@ -15,6 +16,15 @@ import org.junit.Test
  * is validated without any hardware.
  */
 class Hl2ProtocolTest {
+
+    @Test
+    fun invalidLnaStateIsRejectedInsteadOfClamped() {
+        val state = Hl2Protocol.ControlState().apply { lnaGainDb = 49 }
+        assertThrows(IllegalArgumentException::class.java) {
+            Hl2Protocol.buildControlFrame(1, 0, state, null)
+        }
+        assertEquals(49, state.lnaGainDb)
+    }
 
     private fun s24be(v: Int) = byteArrayOf(
         ((v shr 16) and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte(), (v and 0xFF).toByte()
@@ -223,11 +233,12 @@ class Hl2ProtocolTest {
     }
 
     @Test
-    fun controlFrame_classicBoardUsesStepAttenuatorAndCleanC2() {
+    fun controlFrame_protocol1UsesStepAttenuatorAndCleanC2() {
         // Classic P1 (Hermes/Angelia/Orion): addr 0x0A C4 = bit5 enable +
         // 0..31 dB attenuation; the shared -12..+48 gain scale maps onto it.
         val st = Hl2Protocol.ControlState().apply {
-            classicBoard = true; lnaGainDb = 48        // max gain -> 0 dB att
+            usesClassicCodec = true; classicPhysicalAdcCount = 1
+            lnaGainDb = 48    // max gain -> 0 dB att
             txDrive = 200; paEnabled = true; vnaMode = true; trDisable = true
         }
         val g = Hl2Protocol.buildControlFrame(0, 10, st, null)
@@ -261,21 +272,73 @@ class Hl2ProtocolTest {
     }
 
     @Test
-    fun controlState_txTimingSaturatesToRegisterRange() {
-        // Out-of-range requests saturate instead of wrapping: 500 masked to
-        // 7 bits would be 116, but 200 would wrap to 72 and 128 to 0 ms —
-        // a silent return to the syllable-dropping buffer.
+    fun controlState_txTimingRefusesOutOfRangeWithoutMutation() {
+        // A terminal command must never report APPLIED for a clamped value.
         val st = Hl2Protocol.ControlState()
-        st.txLatencyMs = 500; st.pttHang = 99
-        assertEquals(127, st.txLatencyMs)
-        assertEquals(31, st.pttHang)
-        st.txLatencyMs = -5; st.pttHang = -1
-        assertEquals(0, st.txLatencyMs)
-        assertEquals(0, st.pttHang)
-        st.txLatencyMs = 70; st.pttHang = 30
+        assertThrows(IllegalArgumentException::class.java) { st.txLatencyMs = 500 }
+        assertThrows(IllegalArgumentException::class.java) { st.pttHang = 99 }
+        assertThrows(IllegalArgumentException::class.java) { st.txLatencyMs = -5 }
+        assertThrows(IllegalArgumentException::class.java) { st.pttHang = -1 }
+        assertEquals(70, st.txLatencyMs)
+        assertEquals(30, st.pttHang)
         val f = Hl2Protocol.buildControlFrame(0, 0x16, st, null)
         assertEquals(30, f[526].toInt() and 0xFF)
         assertEquals(70, f[527].toInt() and 0xFF)
+    }
+
+    @Test
+    fun classicAddr0eEncodesTypedRoutesAndKeepsPairedBankNeutral() {
+        val st = Hl2Protocol.ControlState().apply {
+            usesClassicCodec = true
+            classicPhysicalAdcCount = 2
+            receiverCount = 4
+            rxAdc[0] = RxAdc.ADC2
+            rxAdc[1] = RxAdc.ADC1
+            rxAdc[2] = RxAdc.ADC2
+            rxAdc[3] = RxAdc.ADC1
+            cwPttDelayMs = 0x5A
+        }
+        val frame = Hl2Protocol.buildControlFrame(0, 0x0E, st, null)
+        assertEquals(0x0E, (frame[11].toInt() and 0xFF) shr 1)
+        assertEquals(0b0001_0001, frame[12].toInt() and 0xFF)
+        assertTrue(frame.sliceArray(13..15).all { it == 0.toByte() })
+        assertEquals(0x0F, (frame[523].toInt() and 0xFF) shr 1)
+        assertTrue(frame.sliceArray(524..527).all { it == 0.toByte() })
+    }
+
+    @Test
+    fun classicDiversityBitRequiresDistinctAdcsAndLockedNcos() {
+        fun configured() = Hl2Protocol.ControlState().apply {
+            usesClassicCodec = true
+            classicPhysicalAdcCount = 2
+            receiverCount = 2
+            rxAdc[0] = RxAdc.ADC1
+            rxAdc[1] = RxAdc.ADC2
+            rxFreqHz[1] = rxFreqHz[0]
+            diversityMode = DiversityMode.RX1_RX2
+        }
+        val frame = Hl2Protocol.buildControlFrame(0, 0, configured(), null)
+        assertTrue(frame[15].toInt() and 0x80 != 0)
+
+        val sameAdc = configured().apply { rxAdc[1] = RxAdc.ADC1 }
+        assertThrows(IllegalArgumentException::class.java) {
+            Hl2Protocol.buildControlFrame(0, 0, sameAdc, null)
+        }
+        val splitNco = configured().apply { rxFreqHz[1]++ }
+        assertThrows(IllegalArgumentException::class.java) {
+            Hl2Protocol.buildControlFrame(0, 0, splitNco, null)
+        }
+    }
+
+    @Test
+    fun hl2Addr0eKeepsCwLayoutAndNeverSerializesClassicRoutes() {
+        val st = Hl2Protocol.ControlState().apply {
+            rxAdc.fill(RxAdc.ADC2)
+            cwPttDelayMs = 37
+        }
+        val frame = Hl2Protocol.buildControlFrame(0, 0x0E, st, null)
+        assertTrue(frame.sliceArray(12..15).all { it == 0.toByte() })
+        assertEquals(37, frame[526].toInt() and 0xFF)
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.isaklab.isdrdrivers.core
 
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -57,7 +58,15 @@ class SpectrumZoom {
      * zoom control does not restart the filter every frame.
      */
     fun set(decimation: Int, offsetHz: Double, rateHz: Double) {
-        val d = decimation.coerceIn(1, MAX_DECIMATION)
+        require(decimation in 1..MAX_DECIMATION) {
+            "spectrum decimation $decimation is outside 1..$MAX_DECIMATION"
+        }
+        require(rateHz > 0.0 && rateHz.isFinite()) { "spectrum sample rate must be positive" }
+        val maxOffset = rateHz / 2.0 - rateHz / (2.0 * decimation)
+        require(offsetHz.isFinite() && abs(offsetHz) <= maxOffset) {
+            "spectrum offset $offsetHz Hz exceeds ±$maxOffset Hz at ${rateHz.toLong()} Hz/$decimation"
+        }
+        val d = decimation
         if (d != this.decimation) {
             this.decimation = d
             taps = if (d == 1) FloatArray(0) else designTaps(d)

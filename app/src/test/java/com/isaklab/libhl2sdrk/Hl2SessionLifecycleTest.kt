@@ -27,6 +27,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -101,6 +102,10 @@ class Hl2SessionLifecycleTest {
         onDataReceived = { _, _ -> },
         onConnectionStatusChanged = { _, _ -> },
         port = boardSocket.localPort,
+        verifiedBoard = VerifiedProtocol1Board(
+            InetAddress.getByName("127.0.0.1"),
+            Protocol1Profile.HERMES_LITE_2,
+        ),
     ).also { client = it }
 
     // ---- wire helpers -------------------------------------------------------
@@ -119,6 +124,14 @@ class Hl2SessionLifecycleTest {
         ((d[4].toLong() and 0xFF) shl 24) or ((d[5].toLong() and 0xFF) shl 16) or
             ((d[6].toLong() and 0xFF) shl 8) or (d[7].toLong() and 0xFF)
 
+    private fun addr(d: ByteArray): Int = (d[11].toInt() and 0xFE) ushr 1
+
+    private fun be32(d: ByteArray, offset: Int): Long =
+        ((d[offset].toLong() and 0xFF) shl 24) or
+            ((d[offset + 1].toLong() and 0xFF) shl 16) or
+            ((d[offset + 2].toLong() and 0xFF) shl 8) or
+            (d[offset + 3].toLong() and 0xFF)
+
     private fun snapshot(): List<Wire> = synchronized(wire) { ArrayList(wire) }
 
     private fun framesFrom(port: Int) = snapshot().filter { it.port == port && isControlFrame(it.data) }
@@ -136,6 +149,30 @@ class Hl2SessionLifecycleTest {
     }
 
     // ---- tests --------------------------------------------------------------
+
+    @Test
+    fun txFrequencyIsTerminalOnWireAndUnavailableTransportCannotMutateIt() {
+        val c = newClient()
+        runBlocking { assertTrue(c.connect()) }
+        val port = currentPort()
+        val terminalHz = 14_200_000L
+
+        assertTrue(c.setTxFrequency(terminalHz))
+        awaitFrames(port, 2)
+        assertTrue(
+            "terminal TX-frequency bank was not observed on the wire",
+            framesFrom(port).any { addr(it.data) == 0 && be32(it.data, 524) == terminalHz },
+        )
+
+        c.disconnect()
+        assertThrows(IllegalStateException::class.java) {
+            c.setTxFrequency(21_200_000L)
+        }
+        val state = Hl2Client::class.java.getDeclaredField("state")
+            .apply { isAccessible = true }
+            .get(c) as Hl2Protocol.ControlState
+        assertEquals(terminalHz, state.txFreqHz)
+    }
 
     /**
      * Disconnecting mid-over is the clean path, and it is exactly the path
@@ -282,6 +319,10 @@ class Hl2SessionLifecycleTest {
             onDataReceived = { _, _ -> },
             onConnectionStatusChanged = { _, m -> statuses.add(m) },
             port = boardSocket.localPort,
+            verifiedBoard = VerifiedProtocol1Board(
+                InetAddress.getByName("127.0.0.1"),
+                Protocol1Profile.HERMES_LITE_2,
+            ),
         ).also { client = it }
         runBlocking { assertTrue(c.connect()) }
         val port = currentPort()

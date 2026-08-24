@@ -71,7 +71,8 @@ interface RadioClient {
 
     /**
      * Set the sampling rate, in Hz. A radio that cannot honour the exact value
-     * is expected to apply the nearest rate it can rather than refuse.
+     * must refuse (normally by throwing); substituting a nearby rate is never
+     * an acceptable terminal success.
      */
     fun setSampleRate(hz: Int)
 
@@ -97,12 +98,11 @@ interface RadioClient {
 interface TransmitCapable {
 
     /**
-     * Tune the transmitter, in Hz. Separate from [RadioClient.setFrequency]
-     * because the host deliberately offsets the RECEIVER from the operator's
-     * frequency to keep the wanted signal away from the converter's zero bin,
-     * while the transmitted carrier has to land exactly on it.
+     * Program and confirm the transmit frequency without changing the receive
+     * frequency. False means the adapter cannot provide that invariant or the
+     * hardware did not confirm it; callers must then reject the command.
      */
-    fun setTxFrequency(hz: Long)
+    fun setTxFrequency(hz: Long): Boolean
 
     /** Key or unkey the transmitter. */
     fun setPtt(on: Boolean)
@@ -111,6 +111,18 @@ interface TransmitCapable {
     fun submitTxIq(iq: FloatArray)
 
     fun isTransmitting(): Boolean
+}
+
+/** A CAT rig whose mode and receive controls have confirmed write results. */
+interface CatControlCapable {
+    /** Apply [mode] in the shared CAT mode-code space. */
+    fun setCatMode(mode: Int): Boolean
+
+    /** Current mode in the shared CAT mode-code space, or -1 when unknown. */
+    fun currentCatMode(): Int
+
+    /** Apply one shared CATCTL_* receive control and confirm it. */
+    fun setCatControl(id: Int, value: Int): Boolean
 }
 
 /** Radios whose transmit level and power amplifier are host-controlled. */
@@ -147,7 +159,8 @@ interface AnalogFilterCapable {
  * [latencyMs] is how much TX audio the radio buffers before RF starts — the
  * slack that absorbs network jitter on the host→board stream. [hangMs] keeps
  * the transmitter keyed after the audio stops so short gaps do not bounce the
- * T/R relay. Each radio clamps both to its own register range.
+ * T/R relay. Each radio validates its own register range and refuses values it
+ * cannot represent exactly.
  */
 interface TxTimingCapable {
     fun setTxTiming(latencyMs: Int, hangMs: Int)

@@ -35,12 +35,35 @@ class G2ProtocolTest {
         assertEquals(27, info.gatewareVersion)
         assertEquals(7, info.ddcCount)
         assertTrue(!info.busy)
-        assertEquals("Saturn (ANAN-G2)", G2Protocol.Board.name(info.boardId))
+        assertEquals("Saturn (ANAN-G2)", G2Protocol.DiscoveryBoardId.name(info.boardId))
 
         reply[4] = 0x03
         assertTrue(G2Protocol.parseDiscoveryReply(reply, reply.size)!!.busy)
         reply[4] = 0x77
         assertNull(G2Protocol.parseDiscoveryReply(reply, reply.size))
+    }
+
+    @Test
+    fun discovery_productIdentity_acceptsOnlySaturnG2Products() {
+        listOf(
+            G2Protocol.DiscoveryBoardId.ORION2,
+            G2Protocol.DiscoveryBoardId.SATURN,
+            G2Protocol.DiscoveryBoardId.SATURN_MK2,
+            G2Protocol.DiscoveryBoardId.G2E,
+        ).forEach { id ->
+            assertTrue("G2 product id $id was rejected", G2Protocol.DiscoveryBoardId.isG2Product(id))
+        }
+
+        listOf(
+            G2Protocol.DiscoveryBoardId.ATLAS,
+            G2Protocol.DiscoveryBoardId.HERMES,
+            G2Protocol.DiscoveryBoardId.HERMES2,
+            G2Protocol.DiscoveryBoardId.ANGELIA,
+            G2Protocol.DiscoveryBoardId.ORION,
+            G2Protocol.DiscoveryBoardId.HERMES_LITE,
+        ).forEach { id ->
+            assertTrue("non-G2 product id $id was accepted", !G2Protocol.DiscoveryBoardId.isG2Product(id))
+        }
     }
 
     // ---- host -> radio commands --------------------------------------------

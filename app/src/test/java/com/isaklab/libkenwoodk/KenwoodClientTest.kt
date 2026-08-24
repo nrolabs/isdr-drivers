@@ -202,6 +202,15 @@ class KenwoodClientTest {
         assertEquals("TS-990S", c.modelName())
         assertEquals(1, h.writesOf("##ID00705kenwoodadmin;"))
         assertEquals(1, h.writesOf("##ID75kenwoodadmin;"))
+
+        h.on("FA;", "FA00007074000;")
+        h.on("FA;", "FA00007074000;")
+        h.on("FB;", "FB00007100000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT1;")
+        assertTrue(c.setTxFrequency(7_100_000))
+        assertEquals(7_074_000L, c.frequencyHz())
+        assertEquals(0, h.writesOf("FA00007100000;"))
         c.disconnect()
     }
 
@@ -463,6 +472,69 @@ class KenwoodClientTest {
         h.pushUnsolicited("RX;")
         waitUntil { !c.isTransmitting() }
         assertFalse(c.isTransmitting())
+        c.disconnect()
+    }
+
+    @Test
+    fun `tx frequency uses vfo b split and leaves receive vfo a invariant`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        h.on("FA;", "FA00014100000;")
+        h.on("FA;", "FA00014100000;")
+        h.on("FB;", "FB00014250000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT1;")
+
+        assertTrue(c.setTxFrequency(14_250_000))
+        assertEquals(14_100_000L, c.frequencyHz())
+        val written = h.written()
+        assertTrue(written.contains("FB00014250000;"))
+        assertTrue(written.contains("FR0;"))
+        assertTrue(written.contains("FT1;"))
+        assertEquals(0, h.writesOf("FA00014250000;"))
+
+        val order = listOf("FB00014250000;", "FB;", "FR0;", "FR;", "FT1;", "FT;")
+            .map { written.indexOf(it) }
+        assertTrue(order.all { it >= 0 })
+        assertTrue(order.zipWithNext().all { (a, b) -> a < b })
+        c.disconnect()
+    }
+
+    @Test
+    fun `tx split rejects mismatched readback and never writes receive vfo`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, _) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+
+        h.on("FA;", "FA00014100000;")
+        h.on("FB;", "FB00014249000;")
+        assertFalse(c.setTxFrequency(14_250_000))
+        assertEquals(14_100_000L, c.frequencyHz())
+        assertEquals(0, h.writesOf("FR0;"))
+        assertEquals(0, h.writesOf("FT1;"))
+        assertEquals(0, h.writesOf("FA00014250000;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `tx split reports receive vfo race and reconciles final value`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, _) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+
+        h.on("FA;", "FA00014100000;")
+        h.on("FA;", "FA00014101000;")
+        h.on("FB;", "FB00014250000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT1;")
+        assertFalse(c.setTxFrequency(14_250_000))
+        assertEquals(14_101_000L, c.frequencyHz())
+        assertEquals(0, h.writesOf("FA00014250000;"))
         c.disconnect()
     }
 
