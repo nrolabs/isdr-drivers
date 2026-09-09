@@ -1218,6 +1218,7 @@ class DriverSession(
                     DriverProto.FEAT_COMMAND_RESULTS or
                     DriverProto.FEAT_RTL_GAIN_TABLE or
                     DriverProto.FEAT_CAT_REPEATER or
+                    DriverProto.FEAT_CAT_EXACT_PROFILE or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -1760,6 +1761,16 @@ class DriverSession(
             send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
             return
         }
+        val catProfile = if (kind == DriverProto.DEV_CAT) {
+            catOpenFlagsFailure(flags)?.let { detail ->
+                onStatus(false, detail)
+                send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
+                return
+            }
+            DriverProto.catProfile(flags)
+        } else {
+            null
+        }
         // Read-only discovery preflight happens before closeDevice/claimDevice:
         // a wrong board id or dead selected chassis must not disturb the radio
         // this session already owns, much less emit start/control frames to the
@@ -1894,10 +1905,37 @@ class DriverSession(
                         if (transport == null) {
                             false
                         } else {
-                            val c = CivClient(transport, flags and 0xFF, ::onData, onStatusGen)
+                            val profile = checkNotNull(catProfile)
+                            val exact = profile != DriverProto.CAT_PROFILE_GENERIC
+                            val identityTransport = if (exact) {
+                                ExactCivIdentityTransport(transport, profile)
+                            } else {
+                                null
+                            }
+                            val gate = if (exact) {
+                                ExactCatAdmissionGate(::onData, onStatusGen)
+                            } else {
+                                null
+                            }
+                            val c = CivClient(
+                                identityTransport ?: transport,
+                                flags and DriverProto.CAT_ADDRESS_MASK,
+                                gate?.let { it::onData } ?: ::onData,
+                                gate?.let { it::onStatus } ?: onStatusGen,
+                            )
                             cat = c
                             radio = c
-                            c.connect()
+                            val connected = c.connect()
+                            if (gate == null) {
+                                connected
+                            } else {
+                                val identityFailure = identityTransport?.identityFailure
+                                    ?: catPhysicalIdentityFailure(
+                                        profile,
+                                        identityTransport?.physicalIdentity,
+                                    )
+                                gate.finish(connected, identityFailure, c.modelName())
+                            }
                         }
                     }
                     DriverProto.CAT_DIALECT_KENWOOD -> {
@@ -1936,16 +1974,38 @@ class DriverSession(
                         if (transport == null) {
                             false
                         } else {
+                            val profile = checkNotNull(catProfile)
+                            val exact = profile != DriverProto.CAT_PROFILE_GENERIC
+                            val identityTransport = if (exact) {
+                                ExactKenwoodIdentityTransport(transport, profile)
+                            } else {
+                                null
+                            }
+                            val gate = if (exact) {
+                                ExactCatAdmissionGate(::onData, onStatusGen)
+                            } else {
+                                null
+                            }
                             val c = KenwoodClient(
-                                transport,
+                                identityTransport ?: transport,
                                 if (serial) KenwoodClient.Link.SERIAL else KenwoodClient.Link.LAN,
                                 credentials,
-                                ::onData,
-                                onStatusGen,
+                                gate?.let { it::onData } ?: ::onData,
+                                gate?.let { it::onStatus } ?: onStatusGen,
                             )
                             kenwoodCat = c
                             radio = c
-                            c.connect()
+                            val connected = c.connect()
+                            if (gate == null) {
+                                connected
+                            } else {
+                                val identityFailure = identityTransport?.identityFailure
+                                    ?: catPhysicalIdentityFailure(
+                                        profile,
+                                        identityTransport?.physicalIdentity,
+                                    )
+                                gate.finish(connected, identityFailure, c.modelName())
+                            }
                         }
                     }
                     else -> {

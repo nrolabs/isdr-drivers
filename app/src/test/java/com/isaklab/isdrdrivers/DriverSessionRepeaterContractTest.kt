@@ -144,8 +144,11 @@ class DriverSessionRepeaterContractTest {
             h.wire.writeI32(DriverProto.CMD_HELLO, DriverProto.VERSION)
             val hello = h.wire.read()!!
             assertEquals(DriverProto.EV_HELLO, hello.op)
-            assertEquals(DriverProto.VERSION, hello.payload.int)
-            assertTrue(hello.payload.int and DriverProto.FEAT_CAT_REPEATER != 0)
+            val version = hello.payload.int
+            val features = hello.payload.int
+            assertEquals(DriverProto.VERSION, version)
+            assertTrue(features and DriverProto.FEAT_CAT_REPEATER != 0)
+            assertTrue(features and DriverProto.FEAT_CAT_EXACT_PROFILE != 0)
         } finally {
             h.session.close()
             h.socket.close()
