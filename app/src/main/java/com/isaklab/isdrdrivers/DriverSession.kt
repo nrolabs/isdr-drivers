@@ -1617,18 +1617,23 @@ class DriverSession(
                         repeater.setCatRepeater(config)
                     } catch (e: Exception) {
                         e.message ?: e.javaClass.simpleName
+                    }
+                    try {
+                        sendCommandResult(
+                            DriverProto.CMD_CAT_SET_REPEATER,
+                            if (failure == null) {
+                                DriverProto.COMMAND_ACCEPTED
+                            } else {
+                                DriverProto.COMMAND_REJECTED
+                            },
+                            failure ?: "",
+                        )
                     } finally {
+                        // V3 terminal results are associated FIFO by opcode.
+                        // Do not admit a successor until this result is on the
+                        // wire, otherwise two workers could invert association.
                         repeaterCommandInFlight.set(false)
                     }
-                    sendCommandResult(
-                        DriverProto.CMD_CAT_SET_REPEATER,
-                        if (failure == null) {
-                            DriverProto.COMMAND_ACCEPTED
-                        } else {
-                            DriverProto.COMMAND_REJECTED
-                        },
-                        failure ?: "",
-                    )
                 }
                 return
             }

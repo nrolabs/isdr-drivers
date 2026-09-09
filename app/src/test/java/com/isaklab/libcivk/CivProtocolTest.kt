@@ -52,6 +52,34 @@ class CivProtocolTest {
     }
 
     @Test
+    fun `repeater frames are byte exact in both directions`() {
+        val rig = 0x94
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, rig, 0xE0, 0x0F, 0x12, 0xFD),
+            P.setDuplex(rig, com.isaklab.isdrproto.CatRepeater.DUPLEX_PLUS),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, rig, 0xE0, 0x0C, 0xFD),
+            P.readRepeaterOffset(rig),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, rig, 0xE0, 0x0D, 0x00, 0x60, 0x00, 0xFD),
+            P.setRepeaterOffset(rig, 600_000, 3),
+        )
+        assertEquals(600_000L, P.parseRepeaterOffset(bytes(0x00, 0x60, 0x00), 3))
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, rig, 0xE0, 0x1B, 0x00, 0x00, 0x08, 0x85, 0xFD),
+            P.setCtcssTone(rig, P.SUB_TONE_TX, 885),
+        )
+        assertEquals(885, P.parseCtcssTone(bytes(0x00, 0x00, 0x08, 0x85), P.SUB_TONE_TX))
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, rig, 0xE0, 0x1B, 0x02, 0x10, 0x00, 0x23, 0xFD),
+            P.setDcs(rig, 23, 1, 0),
+        )
+        assertEquals(Triple(23, 1, 0), P.parseDcs(bytes(0x02, 0x10, 0x00, 0x23)))
+    }
+
+    @Test
     fun `bcd rejects overflow and bad nibbles`() {
         assertNull(P.toBcdLe(10_000_000_000L, 5))
         assertNull(P.fromBcdLe(bytes(0x0A)))

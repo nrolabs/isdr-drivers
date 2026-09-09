@@ -16,7 +16,11 @@
 package com.isaklab.libcivk
 
 import com.isaklab.libcivk.CivProtocol as P
+import com.isaklab.isdrproto.CatRepeater
+import com.isaklab.isdrproto.CatRepeaterConfig
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -54,7 +58,7 @@ class CivClientTest {
      * Answers each written frame from a script keyed by command byte,
      * echoing the controller's own frame first the way the shared bus does.
      */
-    private class FakeRig(private val echo: Boolean) : CivTransport {
+    private class FakeRig(private val echo: Boolean, private val address: Int = RIG) : CivTransport {
         private val lock = Object()
         private val replies = ArrayList<Pair<Int, ArrayDeque<ByteArray>>>()
         private val inbox = ArrayDeque<Byte>()
@@ -70,18 +74,18 @@ class CivClientTest {
 
         fun ack(cmd: Int) = on(
             cmd,
-            byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), RIG.toByte(),
+            byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), address.toByte(),
                 0xFB.toByte(), 0xFD.toByte()),
         )
 
         fun nak(cmd: Int) = on(
             cmd,
-            byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), RIG.toByte(),
+            byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), address.toByte(),
                 0xFA.toByte(), 0xFD.toByte()),
         )
 
         fun reply(cmd: Int, data: ByteArray) {
-            val f = byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), RIG.toByte(),
+            val f = byteArrayOf(0xFE.toByte(), 0xFE.toByte(), 0xE0.toByte(), address.toByte(),
                 cmd.toByte()) + data + byteArrayOf(0xFD.toByte())
             on(cmd, f)
         }
@@ -98,6 +102,10 @@ class CivClientTest {
         fun lastWritten(): ByteArray = synchronized(lock) { written.last().copyOf() }
 
         fun totalWrites(): Int = synchronized(lock) { written.size }
+
+        fun writtenFrames(): List<ByteArray> = synchronized(lock) {
+            written.map { it.copyOf() }
+        }
 
         override fun writeAll(bytes: ByteArray) {
             synchronized(lock) {
@@ -153,6 +161,35 @@ class CivClientTest {
 
     private fun connect(c: CivClient): Boolean = runBlocking { c.connect() }
 
+    private fun scriptLegacyRepeaterState(
+        rig: FakeRig,
+        repeaterTone: Int,
+        toneSquelch: Int,
+        txTone: Int,
+        rxTone: Int,
+    ) {
+        rig.reply(P.CMD_FUNC, bytes(P.SUB_FUNC_REPEATER_TONE, repeaterTone))
+        rig.reply(P.CMD_FUNC, bytes(P.SUB_FUNC_TONE_SQUELCH, toneSquelch))
+        rig.reply(P.CMD_TONE, byteArrayOf(P.SUB_TONE_TX.toByte()) + P.toBcdBe(txTone.toLong(), 3)!!)
+        rig.reply(P.CMD_TONE, byteArrayOf(P.SUB_TONE_RX.toByte()) + P.toBcdBe(rxTone.toLong(), 3)!!)
+    }
+
+    private fun waitForWrittenBody(rig: FakeRig, timeoutMs: Long, vararg body: Int): Boolean {
+        val expected = bytes(*body)
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        do {
+            if (rig.writtenFrames().any { frame ->
+                    frame.size == expected.size + 5 &&
+                        frame.copyOfRange(4, frame.size - 1).contentEquals(expected)
+                }
+            ) {
+                return true
+            }
+            Thread.sleep(2)
+        } while (System.nanoTime() < deadline)
+        return false
+    }
+
     @Test
     fun `connect reads state and enables scope`() {
         val rig = FakeRig(echo = true)
@@ -195,11 +232,15 @@ class CivClientTest {
         assertTrue(connect(c))
 
         rig.ack(P.CMD_WRITE_FREQ)
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(7_074_000, 5)!!)
         c.setFrequency(7_074_000)
         assertEquals(7_074_000L, c.frequencyHz())
 
         rig.nak(P.CMD_WRITE_FREQ)
-        c.setFrequency(50_313_000)
+        try {
+            c.setFrequency(50_313_000)
+        } catch (_: IllegalStateException) {
+        }
         assertEquals(7_074_000L, c.frequencyHz())
         c.disconnect()
     }
@@ -228,6 +269,7 @@ class CivClientTest {
         // No reply scripted for the first attempt; the second gets the ACK.
         rig.on(P.CMD_WRITE_FREQ, ByteArray(0))
         rig.ack(P.CMD_WRITE_FREQ)
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(7_074_000, 5)!!)
         c.setFrequency(7_074_000)
         assertEquals(7_074_000L, c.frequencyHz())
         assertEquals(2, rig.writesOf(P.CMD_WRITE_FREQ))
@@ -331,16 +373,160 @@ class CivClientTest {
         assertFalse(c.isTransmitting())
 
         rig.ack(P.CMD_PTT)
+        rig.reply(P.CMD_PTT, byteArrayOf(P.SUB_PTT.toByte(), 1))
         c.setPtt(true)
         assertTrue(c.isTransmitting())
 
         rig.nak(P.CMD_PTT)
-        c.setPtt(false)
+        try {
+            c.setPtt(false)
+        } catch (_: IllegalStateException) {
+        }
         assertTrue(c.isTransmitting())
 
         rig.ack(P.CMD_PTT)
+        rig.reply(P.CMD_PTT, byteArrayOf(P.SUB_PTT.toByte(), 0))
         c.setPtt(false)
         assertFalse(c.isTransmitting())
+        c.disconnect()
+    }
+
+    @Test
+    fun `IC7300 repeater accepts only the final physical readback`() {
+        val rig = FakeRig(echo = true)
+        scriptConnect(rig)
+        val (c, _) = makeClient(rig, RIG)
+        assertTrue(connect(c))
+        assertEquals(
+            CatRepeater.CAP_CTCSS_TX or CatRepeater.CAP_CTCSS_RX,
+            c.catRepeaterCapabilities(),
+        )
+
+        val requested = CatRepeaterConfig(
+            CatRepeater.DUPLEX_SIMPLEX,
+            0,
+            CatRepeater.TONE_CTCSS,
+            885,
+            CatRepeater.DCS_NORMAL,
+            CatRepeater.TONE_CTCSS,
+            915,
+            CatRepeater.DCS_NORMAL,
+        )
+        rig.reply(P.CMD_PTT, bytes(P.SUB_PTT, 0))
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_FM, 1))
+        scriptLegacyRepeaterState(rig, 0, 0, 885, 885)
+        rig.ack(P.CMD_FUNC) // make TX/RX selectors inert
+        rig.ack(P.CMD_FUNC)
+        rig.ack(P.CMD_TONE) // write exact latent TX/RX tones
+        rig.ack(P.CMD_TONE)
+        rig.ack(P.CMD_FUNC) // activate tone squelch last
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_FM, 1))
+        scriptLegacyRepeaterState(rig, 0, 1, 885, 915)
+
+        assertEquals(null, c.setCatRepeater(requested))
+        assertTrue(
+            rig.writtenFrames().any {
+                it.contentEquals(P.setCtcssTone(RIG, P.SUB_TONE_TX, 885))
+            },
+        )
+        assertTrue(
+            rig.writtenFrames().any {
+                it.contentEquals(P.setCtcssTone(RIG, P.SUB_TONE_RX, 915))
+            },
+        )
+        c.disconnect()
+    }
+
+    @Test
+    fun `undocumented CI-V profile refuses repeater without io`() {
+        val address = 0x5E
+        val rig = FakeRig(echo = true, address = address)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, address))
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_FM, 1))
+        val (c, _) = makeClient(rig, address)
+        assertTrue(connect(c))
+        assertEquals(0, c.catRepeaterCapabilities())
+        val before = rig.totalWrites()
+
+        val error = c.setCatRepeater(
+            CatRepeaterConfig(
+                CatRepeater.DUPLEX_SIMPLEX,
+                0,
+                CatRepeater.TONE_OFF,
+                0,
+                CatRepeater.DCS_NORMAL,
+                CatRepeater.TONE_OFF,
+                0,
+                CatRepeater.DCS_NORMAL,
+            ),
+        )
+
+        assertTrue(error?.contains("no documented repeater controls") == true)
+        assertEquals(before, rig.totalWrites())
+        c.disconnect()
+    }
+
+    @Test
+    fun `priority unkey cancels CI-V repeater at a complete frame boundary`() {
+        val rig = FakeRig(echo = true)
+        scriptConnect(rig)
+        val (c, _) = makeClient(rig, RIG)
+        assertTrue(connect(c))
+        rig.reply(P.CMD_PTT, bytes(P.SUB_PTT, 0))
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_FM, 1))
+        scriptLegacyRepeaterState(rig, 0, 0, 885, 885)
+
+        val requested = CatRepeaterConfig(
+            CatRepeater.DUPLEX_SIMPLEX,
+            0,
+            CatRepeater.TONE_CTCSS,
+            885,
+            CatRepeater.DCS_NORMAL,
+            CatRepeater.TONE_OFF,
+            0,
+            CatRepeater.DCS_NORMAL,
+        )
+        val result = AtomicReference<String?>()
+        val transaction = thread(name = "civ-repeater-test") {
+            result.set(c.setCatRepeater(requested))
+        }
+        assertTrue(
+            waitForWrittenBody(
+                rig,
+                1_000,
+                P.CMD_FUNC,
+                P.SUB_FUNC_REPEATER_TONE,
+                0,
+            ),
+        )
+
+        // The mutating FUNC write deliberately has no reply. Cancellation
+        // must drain that untagged reply slot before PTT OFF uses the bus.
+        rig.ack(P.CMD_PTT)
+        rig.reply(P.CMD_PTT, bytes(P.SUB_PTT, 0))
+        val cancelAt = System.nanoTime()
+        c.requestCatRepeaterCancelForUnkey()
+        c.setPtt(false)
+        val unkeyLatencyMs = (System.nanoTime() - cancelAt) / 1_000_000
+        transaction.join(1_000)
+
+        assertFalse(transaction.isAlive)
+        assertTrue(result.get()?.contains("cancelled for priority unkey") == true)
+        assertTrue("unkey latency was ${unkeyLatencyMs}ms", unkeyLatencyMs < 750)
+        val frames = rig.writtenFrames()
+        val mutation = P.setFunc(RIG, P.SUB_FUNC_REPEATER_TONE, 0)
+        val unkey = P.setPtt(RIG, false)
+        val mutationIndex = frames.indexOfFirst { it.contentEquals(mutation) }
+        val unkeyIndex = frames.indexOfFirst { it.contentEquals(unkey) }
+        assertTrue(mutationIndex >= 0)
+        assertTrue(unkeyIndex > mutationIndex)
+        assertEquals(
+            1,
+            frames.subList(mutationIndex, unkeyIndex).count {
+                it.size > 4 && (it[4].toInt() and 0xFF) == P.CMD_FUNC
+            },
+        )
         c.disconnect()
     }
 
@@ -538,7 +724,7 @@ class CivClientTest {
     @Test
     fun `filter width refused off the known family`() {
         // An unlisted address gets full control but no 0x1A gamble.
-        val rig = FakeRig(echo = true)
+        val rig = FakeRig(echo = true, address = 0x5E)
         rig.reply(P.CMD_READ_ID, byteArrayOf(P.SUB_ID.toByte(), 0x5E))
         rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
         rig.reply(P.CMD_READ_MODE, byteArrayOf(P.MODE_USB.toByte(), 0x01))
@@ -574,7 +760,10 @@ class CivClientTest {
         assertTrue(connect(c))
         c.disconnect()
         c.disconnect()
-        c.setFrequency(7_000_000) // must not hang or throw after teardown
+        try {
+            c.setFrequency(7_000_000)
+        } catch (_: IllegalStateException) {
+        }
         assertEquals(14_074_000L, c.frequencyHz())
     }
 }
