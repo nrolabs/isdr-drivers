@@ -18,6 +18,8 @@ package com.isaklab.libkenwoodk
 import com.isaklab.libcivk.CivTransport
 import com.isaklab.libkenwoodk.KenwoodClient.Link
 import com.isaklab.libkenwoodk.KenwoodProtocol as P
+import com.isaklab.isdrproto.CatRepeater
+import com.isaklab.isdrproto.CatRepeaterConfig
 import java.util.ArrayDeque
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -137,6 +139,43 @@ class KenwoodClientTest {
         h.on("BSO;", "BSO0;")
     }
 
+    private fun repeaterConfig() = CatRepeaterConfig(
+        duplex = CatRepeater.DUPLEX_PLUS,
+        offsetHz = 600_000,
+        txKind = CatRepeater.TONE_CTCSS,
+        txValue = 885,
+        txPolarity = CatRepeater.DCS_NORMAL,
+        rxKind = CatRepeater.TONE_CTCSS,
+        rxValue = 915,
+        rxPolarity = CatRepeater.DCS_NORMAL,
+    )
+
+    /** Complete TS-890 transaction readbacks, including final physical proof. */
+    private fun scriptTs890Repeater(h: FakeRig) {
+        repeat(2) { h.on("OM0;", "OM04;") }
+        h.on("FA;", "FA00014100000;")
+        h.on("FB;", "FB00014200000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT0;")
+        h.on("TO;", "TO0;")
+        h.on("TN;", "TN00;")
+        h.on("CN;", "CN00;")
+        h.on("TN;", "TN08;")
+        h.on("CN;", "CN09;")
+        h.on("TO;", "TO3;")
+        h.on("FB;", "FB00014700000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT1;")
+        h.on("FA;", "FA00014100000;")
+        h.on("FA;", "FA00014100000;")
+        h.on("FB;", "FB00014700000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT1;")
+        h.on("TO;", "TO3;")
+        h.on("TN;", "TN08;")
+        h.on("CN;", "CN09;")
+    }
+
     private fun waitUntil(cond: () -> Boolean) {
         val deadline = System.currentTimeMillis() + 2_000
         while (!cond() && System.currentTimeMillis() < deadline) {
@@ -206,8 +245,7 @@ class KenwoodClientTest {
         h.on("FA;", "FA00007074000;")
         h.on("FA;", "FA00007074000;")
         h.on("FB;", "FB00007100000;")
-        h.on("FR;", "FR0;")
-        h.on("FT;", "FT1;")
+        h.on("TB;", "TB1;")
         assertTrue(c.setTxFrequency(7_100_000))
         assertEquals(7_074_000L, c.frequencyHz())
         assertEquals(0, h.writesOf("FA00007100000;"))
@@ -453,24 +491,111 @@ class KenwoodClientTest {
     }
 
     @Test
+    fun `ts890 repeater is atomic and confirmed from physical readback`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, _) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+        scriptTs890Repeater(h)
+
+        assertEquals(null, c.setCatRepeater(repeaterConfig()))
+        assertEquals(
+            CatRepeater.CAP_DUPLEX or CatRepeater.CAP_OFFSET or
+                CatRepeater.CAP_CTCSS_TX or CatRepeater.CAP_CTCSS_RX,
+            c.catRepeaterCapabilities(),
+        )
+        val written = h.written()
+        for (command in listOf("TN08;", "CN09;", "TO3;", "FB00014700000;", "FR0;", "FT1;")) {
+            assertTrue("missing $command", written.contains(command))
+        }
+        assertTrue(written.indexOf("FB00014700000;") < written.lastIndexOf("FT1;"))
+        assertEquals(0, h.writesOf("FA00014700000;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `unknown tone and dcs are refused without touching the rig`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, _) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+        val before = h.written().size
+        val unsupported = repeaterConfig().copy(
+            txKind = CatRepeater.TONE_DCS,
+            txValue = 23,
+        )
+        assertTrue(c.setCatRepeater(unsupported)!!.contains("DCS"))
+        assertEquals(before, h.written().size)
+        c.disconnect()
+    }
+
+    @Test
+    fun `priority unkey cancels after current frame and runs next on wire`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, _) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+
+        h.on("OM0;", "OM04;")
+        h.on("FA;", "FA00014100000;")
+        h.on("FB;", "FB00014200000;")
+        h.on("FR;", "FR0;")
+        h.on("FT;", "FT0;")
+        h.on("TO;", "TO0;")
+        h.on("TN;", "TN00;")
+        h.on("CN;", "CN00;")
+        h.on("TN;", "TN08;")
+        h.on("CN;", "CN09;")
+        h.on("TO;", "TO3;")
+        // No reply to the FB read after this mutating frame: the transaction
+        // is deliberately stopped in the middle of its physical sequence.
+        val result = arrayOfNulls<String>(1)
+        val worker = Thread { result[0] = c.setCatRepeater(repeaterConfig()) }
+        worker.start()
+        waitUntil { h.writesOf("FB00014700000;") == 1 && h.writesOf("FB;") >= 2 }
+
+        h.on("RX;", "RX;")
+        val started = System.nanoTime()
+        c.requestCatRepeaterCancelForUnkey()
+        val unkey = Thread { c.setPtt(false) }
+        unkey.start()
+        worker.join(700)
+        unkey.join(700)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+        assertFalse("repeater worker did not stop", worker.isAlive)
+        assertFalse("unkey did not complete", unkey.isAlive)
+        assertTrue(result[0]!!, result[0]!!.contains("uncertain"))
+        assertTrue("priority unkey took ${elapsedMs}ms", elapsedMs < 500)
+        val written = h.written()
+        assertTrue(written.indexOf("FB00014700000;") < written.indexOf("RX;"))
+        assertEquals(0, h.writesOf("FB00014200000;")) // no slow rollback before unkey
+        c.disconnect()
+    }
+
+    @Test
     fun `ptt sends tx rx and ai corrects the cache`() {
         val h = FakeRig()
         scriptLanTs890(h)
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
 
+        h.on("TX0;", "TX0;")
         c.setPtt(true)
         waitUntil { h.writesOf("TX0;") == 1 }
         assertTrue(c.isTransmitting())
+        h.on("RX;", "RX;")
         c.setPtt(false)
         waitUntil { h.writesOf("RX;") == 1 }
         assertFalse(c.isTransmitting())
 
         // The rig refuses to key (e.g. no ##TI grant): its RX report corrects
         // the optimistic cache.
-        c.setPtt(true)
-        h.pushUnsolicited("RX;")
-        waitUntil { !c.isTransmitting() }
+        h.on("TX0;", "RX;")
+        try {
+            c.setPtt(true)
+        } catch (_: IllegalStateException) {
+        }
         assertFalse(c.isTransmitting())
         c.disconnect()
     }
@@ -571,7 +696,13 @@ class KenwoodClientTest {
         // The rig answers the read-back with the error token: the cache
         // keeps the last confirmed value.
         h.on("FA;", "?;")
-        c.setFrequency(7_074_000)
+        var refused = false
+        try {
+            c.setFrequency(7_074_000)
+        } catch (_: IllegalStateException) {
+            refused = true
+        }
+        assertTrue(refused)
         assertEquals(14_100_000L, c.frequencyHz())
         c.disconnect()
     }
@@ -584,7 +715,13 @@ class KenwoodClientTest {
         assertTrue(connect(c))
         c.disconnect()
         c.disconnect()
-        c.setFrequency(7_000_000) // must not hang or panic after teardown
+        var refused = false
+        try {
+            c.setFrequency(7_000_000)
+        } catch (_: IllegalStateException) {
+            refused = true
+        }
+        assertTrue(refused)
         assertEquals(14_100_000L, c.frequencyHz())
     }
 

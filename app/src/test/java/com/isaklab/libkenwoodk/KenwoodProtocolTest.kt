@@ -615,4 +615,41 @@ class KenwoodProtocolTest {
         assertNull(P.slWidthCode(P.MODE_FM, 10_000))
         assertNull(P.slWidthCode(P.MODE_CW, 0))
     }
+
+    @Test
+    fun `repeater selectors and tone banks are byte exact`() {
+        assertEquals("TB0;", P.setTb(false))
+        assertEquals("TB1;", P.setTb(true))
+        assertEquals("TB;", P.getTb())
+        assertEquals(false, P.parseTb("TB0"))
+        assertEquals(true, P.parseTb("TB1"))
+        assertNull(P.parseTb("TB2"))
+
+        // TS-890S unbanked forms.
+        assertEquals("TN09;", P.setTn(null, 915))
+        assertEquals("TN;", P.getTn(null))
+        assertEquals(915, P.parseTn("TN09", null))
+        assertEquals("CN09;", P.setCn(null, 915))
+        assertEquals("CN;", P.getCn(null))
+        assertEquals(915, P.parseCn("CN09", null))
+        assertEquals("TO3;", P.setTo(null, 3))
+        assertEquals(3, P.parseTo("TO3", null))
+
+        // TS-990S carries the physical band before the tone code/mode.
+        assertEquals("TN109;", P.setTn(1, 915))
+        assertEquals("TN1;", P.getTn(1))
+        assertEquals(915, P.parseTn("TN109", 1))
+        assertEquals("CN009;", P.setCn(0, 915))
+        assertEquals(915, P.parseCn("CN009", 0))
+        assertEquals("TO12;", P.setTo(1, 2))
+        assertEquals(2, P.parseTo("TO12", 1))
+        assertNull(P.parseTn("TN009", 1))
+
+        // 50 is the documented 1750-Hz burst selector: rollback may preserve
+        // it, but it is never accepted as continuous CTCSS intent.
+        assertEquals("TN50;", P.setTnCode(null, 50))
+        assertEquals(50, P.parseTnCode("TN50", null))
+        assertNull(P.parseTn("TN50", null))
+        assertNull(P.setTn(null, 600))
+    }
 }

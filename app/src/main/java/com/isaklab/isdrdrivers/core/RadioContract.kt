@@ -15,6 +15,8 @@
  */
 package com.isaklab.isdrdrivers.core
 
+import com.isaklab.isdrproto.CatRepeaterConfig
+
 /**
  * What every radio this host can open is able to do.
  *
@@ -123,6 +125,24 @@ interface CatControlCapable {
 
     /** Apply one shared CATCTL_* receive control and confirm it. */
     fun setCatControl(id: Int, value: Int): Boolean
+}
+
+/** A CAT rig with one proved, atomic repeater state transaction. */
+interface CatRepeaterCapable {
+    /** Exact model-profile capability mask, or zero when identity is unknown. */
+    fun catRepeaterCapabilities(): Int
+
+    /**
+     * Apply [config] and confirm the complete physical state by read-back.
+     * Null is success; a non-null value is the explicit refusal/failure detail.
+     */
+    fun setCatRepeater(config: CatRepeaterConfig): String?
+
+    /**
+     * Ask an in-flight multi-frame transaction to stop at its next safe frame
+     * boundary so an emergency PTT-off command can take the CAT bus.
+     */
+    fun requestCatRepeaterCancelForUnkey()
 }
 
 /** Radios whose transmit level and power amplifier are host-controlled. */

@@ -22,6 +22,7 @@ import com.isaklab.isdrdrivers.core.RadioClient
 import com.isaklab.isdrdrivers.core.AntennaPowerCapable
 import com.isaklab.isdrdrivers.core.AnalogFilterCapable
 import com.isaklab.isdrdrivers.core.CatControlCapable
+import com.isaklab.isdrdrivers.core.CatRepeaterCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrdrivers.core.TxDriveCapable
 import com.isaklab.isdrdrivers.core.TxTimingCapable
@@ -32,6 +33,7 @@ import com.isaklab.isdrproto.DriverProto
 import com.isaklab.isdrproto.IqCodec
 import com.isaklab.isdrproto.SpectrumCodec
 import com.isaklab.isdrproto.RadioTelemetry
+import com.isaklab.isdrproto.CatRepeaterConfig
 import com.isaklab.isdrproto.ReceiverWireContract
 import com.isaklab.isdrproto.getBool
 import com.isaklab.isdrproto.getFloats
@@ -60,6 +62,7 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.nio.BufferUnderflowException
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -364,6 +367,7 @@ class DriverSession(
     private var g2: G2Client? = null
     private var cat: CivClient? = null
     private var kenwoodCat: KenwoodClient? = null
+    private val repeaterCommandInFlight = AtomicBoolean(false)
 
     /**
      * Client generation, bumped on every open/close. Driver callbacks carry
@@ -927,6 +931,8 @@ class DriverSession(
             DriverProto.CMD_HRF_OPERACAKE_SET_MODE,
             DriverProto.CMD_CAT_SET_CONTROL -> 8
 
+            DriverProto.CMD_CAT_SET_REPEATER -> DriverProto.CAT_REPEATER_PAYLOAD_LEN
+
             DriverProto.CMD_SET_SPECTRUM_ZOOM,
             DriverProto.CMD_SET_NARROWBAND,
             DriverProto.CMD_SET_RX_FREQUENCY,
@@ -942,8 +948,17 @@ class DriverSession(
             else -> null
         }
         if (fixed != null) {
-            return if (p.remaining() == fixed) null
-            else "payload length ${p.remaining()}, expected $fixed"
+            if (p.remaining() != fixed) {
+                return "payload length ${p.remaining()}, expected $fixed"
+            }
+            if (op == DriverProto.CMD_CAT_SET_REPEATER) {
+                val bytes = ByteArray(p.remaining())
+                p.duplicate().get(bytes)
+                if (CatRepeaterConfig.decode(bytes) == null) {
+                    return "invalid CAT repeater state"
+                }
+            }
+            return null
         }
         if (op == DriverProto.CMD_HRF_OPERACAKE_SET_RANGES ||
             op == DriverProto.CMD_HRF_OPERACAKE_SET_DWELL
@@ -1042,6 +1057,8 @@ class DriverSession(
             DriverProto.CMD_RTL_SET_DIRECT_SAMPLING -> r is RTLTCPClient || r is RTLUSBClient
             DriverProto.CMD_CAT_SET_MODE,
             DriverProto.CMD_CAT_SET_CONTROL -> r is CatControlCapable
+            DriverProto.CMD_CAT_SET_REPEATER ->
+                r is CatRepeaterCapable && r.catRepeaterCapabilities() != 0
             else -> false
         }
         if (!supported) {
@@ -1123,6 +1140,7 @@ class DriverSession(
                     DriverProto.FEAT_BOARD_DIAGNOSTICS or
                     DriverProto.FEAT_COMMAND_RESULTS or
                     DriverProto.FEAT_RTL_GAIN_TABLE or
+                    DriverProto.FEAT_CAT_REPEATER or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -1239,6 +1257,12 @@ class DriverSession(
             DriverProto.CMD_SET_PTT -> p.getBool().let { on ->
                 if (on && !txFrequencyReady) {
                     throw IllegalStateException("PTT blocked after an unconfirmed TX frequency")
+                }
+                if (!on) {
+                    // Set intent before waiting for the driver's fair CAT
+                    // bus lock. The worker finishes/drains its current frame,
+                    // then the unkey is the next command on the wire.
+                    (radio as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
                 }
                 val tx = radio as TransmitCapable
                 tx.setPtt(on)
@@ -1573,6 +1597,40 @@ class DriverSession(
                 val applied = (radio as CatControlCapable).setCatControl(id, value)
                 send { frames.writeCatControlResult(id, value, applied, superseded = false) }
                 if (!applied) throw IllegalStateException("CAT control was not confirmed")
+            }
+
+            DriverProto.CMD_CAT_SET_REPEATER -> {
+                val bytes = ByteArray(p.remaining())
+                p.get(bytes)
+                val config = CatRepeaterConfig.decode(bytes)
+                    ?: throw IOException("invalid CAT repeater state")
+                val repeater = radio as CatRepeaterCapable
+                if (!repeaterCommandInFlight.compareAndSet(false, true)) {
+                    throw IllegalStateException("another CAT repeater transaction is active")
+                }
+                // A physical repeater transaction has many request/read-back
+                // legs. Keep the session reader free so priority PTT-off can
+                // cancel it; the generic terminal result is emitted only by
+                // this worker after the final physical read-back.
+                scope.launch {
+                    val failure = try {
+                        repeater.setCatRepeater(config)
+                    } catch (e: Exception) {
+                        e.message ?: e.javaClass.simpleName
+                    } finally {
+                        repeaterCommandInFlight.set(false)
+                    }
+                    sendCommandResult(
+                        DriverProto.CMD_CAT_SET_REPEATER,
+                        if (failure == null) {
+                            DriverProto.COMMAND_ACCEPTED
+                        } else {
+                            DriverProto.COMMAND_REJECTED
+                        },
+                        failure ?: "",
+                    )
+                }
+                return
             }
 
             else -> {
@@ -1910,6 +1968,7 @@ class DriverSession(
         radio?.setStateListener(null)
         try {
             // Never leave the air keyed behind a closing session.
+            (radio as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
             (radio as? TransmitCapable)?.setPtt(false)
         } catch (_: Exception) {
         }
