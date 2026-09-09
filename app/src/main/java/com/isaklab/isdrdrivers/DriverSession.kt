@@ -64,6 +64,7 @@ import java.nio.BufferUnderflowException
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -368,6 +369,8 @@ class DriverSession(
     private var cat: CivClient? = null
     private var kenwoodCat: KenwoodClient? = null
     private val repeaterCommandInFlight = AtomicBoolean(false)
+    private val repeaterTerminalLock = Object()
+    private var repeaterTerminalTail: CompletableDeferred<Unit>? = null
 
     /**
      * Client generation, bumped on every open/close. Driver callbacks carry
@@ -1101,6 +1104,70 @@ class DriverSession(
         send { frames.writeCommandResult(op, disposition, detail) }
     }
 
+    /**
+     * Repeater completion is deferred while the session reader remains free
+     * for priority PTT OFF. V3 associates generic results FIFO by opcode, so
+     * every repeater request -- including malformed and duplicate requests --
+     * reserves a terminal slot before any asynchronous work can complete.
+     */
+    private fun handleCatRepeater(frame: Frame) {
+        val payload = ByteArray(frame.payload.remaining())
+        frame.payload.duplicate().get(payload)
+        val malformed = controlPayloadError(
+            DriverProto.CMD_CAT_SET_REPEATER,
+            ByteBuffer.wrap(payload),
+        )
+        val unsupported = if (malformed == null) {
+            supportFailure(DriverProto.CMD_CAT_SET_REPEATER)
+        } else {
+            null
+        }
+        val config = if (malformed == null && unsupported == null) {
+            CatRepeaterConfig.decode(payload)
+        } else {
+            null
+        }
+        val repeater = if (config != null) radio as CatRepeaterCapable else null
+        val admitted = repeater != null && repeaterCommandInFlight.compareAndSet(false, true)
+        val terminal = CompletableDeferred<Unit>()
+        val predecessor = synchronized(repeaterTerminalLock) {
+            val previous = repeaterTerminalTail
+            repeaterTerminalTail = terminal
+            previous
+        }
+
+        scope.launch {
+            val (disposition, detail) = when {
+                malformed != null -> DriverProto.COMMAND_MALFORMED to malformed
+                unsupported != null -> unsupported
+                !admitted -> DriverProto.COMMAND_REJECTED to
+                    "another CAT repeater transaction is active"
+                else -> {
+                    val failure = try {
+                        repeater!!.setCatRepeater(config!!)
+                    } catch (e: Exception) {
+                        e.message ?: e.javaClass.simpleName
+                    }
+                    if (failure == null) {
+                        DriverProto.COMMAND_ACCEPTED to ""
+                    } else {
+                        DriverProto.COMMAND_REJECTED to failure
+                    }
+                }
+            }
+            try {
+                predecessor?.await()
+                sendCommandResult(DriverProto.CMD_CAT_SET_REPEATER, disposition, detail)
+            } finally {
+                if (admitted) repeaterCommandInFlight.set(false)
+                terminal.complete(Unit)
+                synchronized(repeaterTerminalLock) {
+                    if (repeaterTerminalTail === terminal) repeaterTerminalTail = null
+                }
+            }
+        }
+    }
+
     // ---- inbound dispatch ----
 
     private fun handle(frame: Frame) {
@@ -1112,6 +1179,10 @@ class DriverSession(
         ) {
             Log.w(TAG, "unauthenticated command 0x${frame.op.toString(16)} — closing")
             close()
+            return
+        }
+        if (frame.op == DriverProto.CMD_CAT_SET_REPEATER) {
+            handleCatRepeater(frame)
             return
         }
         val terminal = needsCommandResult(frame.op)
@@ -1597,45 +1668,6 @@ class DriverSession(
                 val applied = (radio as CatControlCapable).setCatControl(id, value)
                 send { frames.writeCatControlResult(id, value, applied, superseded = false) }
                 if (!applied) throw IllegalStateException("CAT control was not confirmed")
-            }
-
-            DriverProto.CMD_CAT_SET_REPEATER -> {
-                val bytes = ByteArray(p.remaining())
-                p.get(bytes)
-                val config = CatRepeaterConfig.decode(bytes)
-                    ?: throw IOException("invalid CAT repeater state")
-                val repeater = radio as CatRepeaterCapable
-                if (!repeaterCommandInFlight.compareAndSet(false, true)) {
-                    throw IllegalStateException("another CAT repeater transaction is active")
-                }
-                // A physical repeater transaction has many request/read-back
-                // legs. Keep the session reader free so priority PTT-off can
-                // cancel it; the generic terminal result is emitted only by
-                // this worker after the final physical read-back.
-                scope.launch {
-                    val failure = try {
-                        repeater.setCatRepeater(config)
-                    } catch (e: Exception) {
-                        e.message ?: e.javaClass.simpleName
-                    }
-                    try {
-                        sendCommandResult(
-                            DriverProto.CMD_CAT_SET_REPEATER,
-                            if (failure == null) {
-                                DriverProto.COMMAND_ACCEPTED
-                            } else {
-                                DriverProto.COMMAND_REJECTED
-                            },
-                            failure ?: "",
-                        )
-                    } finally {
-                        // V3 terminal results are associated FIFO by opcode.
-                        // Do not admit a successor until this result is on the
-                        // wire, otherwise two workers could invert association.
-                        repeaterCommandInFlight.set(false)
-                    }
-                }
-                return
             }
 
             else -> {

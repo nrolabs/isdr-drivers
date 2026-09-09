@@ -30,6 +30,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -40,10 +41,13 @@ class DriverSessionRepeaterContractTest {
     private class RepeaterRadio(
         private val caps: Int,
         private val blockUntilCancel: Boolean = false,
+        private val blockUntilReleased: Boolean = false,
     ) : RadioClient, TransmitCapable, CatRepeaterCapable {
         val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
         val events = Collections.synchronizedList(ArrayList<String>())
         private val cancel = AtomicBoolean(false)
+        private val repeaterCalls = AtomicInteger()
 
         override suspend fun connect(): Boolean = true
         override fun disconnect() = Unit
@@ -56,8 +60,10 @@ class DriverSessionRepeaterContractTest {
         override fun catRepeaterCapabilities(): Int = caps
 
         override fun setCatRepeater(config: CatRepeaterConfig): String? {
+            val call = repeaterCalls.incrementAndGet()
             events.add("repeater-enter")
             entered.countDown()
+            if (blockUntilReleased && call == 1) release.await(1, TimeUnit.SECONDS)
             if (blockUntilCancel) {
                 while (!cancel.get()) Thread.sleep(2)
                 events.add("repeater-cancelled")
@@ -206,6 +212,36 @@ class DriverSessionRepeaterContractTest {
             assertTrue(events.indexOf("cancel-intent") < events.indexOf("repeater-cancelled"))
             assertTrue(events.indexOf("repeater-cancelled") < events.indexOf("ptt-off"))
             assertFalse(radio.isTransmitting())
+        } finally {
+            h.session.close()
+            h.socket.close()
+        }
+    }
+
+    @Test
+    fun `duplicate repeater results remain FIFO by opcode`() {
+        val radio = RepeaterRadio(
+            CatRepeater.CAP_DUPLEX or CatRepeater.CAP_OFFSET,
+            blockUntilReleased = true,
+        )
+        val h = harness(radio)
+        try {
+            h.wire.write(DriverProto.CMD_CAT_SET_REPEATER, ByteBuffer.wrap(config().encode()))
+            assertTrue(radio.entered.await(1, TimeUnit.SECONDS))
+            h.wire.write(DriverProto.CMD_CAT_SET_REPEATER, ByteBuffer.wrap(config().encode()))
+            radio.release.countDown()
+
+            assertTerminal(
+                h.wire,
+                DriverProto.CMD_CAT_SET_REPEATER,
+                DriverProto.COMMAND_ACCEPTED,
+            )
+            assertTerminal(
+                h.wire,
+                DriverProto.CMD_CAT_SET_REPEATER,
+                DriverProto.COMMAND_REJECTED,
+            )
+            assertEquals(1, radio.events.count { it == "repeater-enter" })
         } finally {
             h.session.close()
             h.socket.close()
