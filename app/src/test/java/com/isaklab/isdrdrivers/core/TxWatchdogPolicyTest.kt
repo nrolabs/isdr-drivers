@@ -105,4 +105,32 @@ class TxWatchdogPolicyTest {
         val now = keyed + TxWatchdogPolicy.MAX_KEYED_MS
         assertTrue(TxWatchdogPolicy.shouldUnkey(true, keyed, now - 1, now))
     }
+
+    @Test fun cat_tx_ignores_iq_silence_but_keeps_the_absolute_ceiling() {
+        val keyed = 100_000L
+        for (elapsed in longArrayOf(
+            TxWatchdogPolicy.NO_STREAM_MS - 1,
+            TxWatchdogPolicy.NO_STREAM_MS,
+            TxWatchdogPolicy.MAX_KEYED_MS - 1,
+        )) {
+            assertFalse(
+                TxWatchdogPolicy.shouldUnkeyFor(
+                    pttOn = true,
+                    keyedAtMs = keyed,
+                    lastTxIqMs = TxWatchdogPolicy.NOT_ARMED,
+                    nowMs = keyed + elapsed,
+                    streamsTxIq = false,
+                ),
+            )
+        }
+        assertTrue(
+            TxWatchdogPolicy.shouldUnkeyFor(
+                pttOn = true,
+                keyedAtMs = keyed,
+                lastTxIqMs = TxWatchdogPolicy.NOT_ARMED,
+                nowMs = keyed + TxWatchdogPolicy.MAX_KEYED_MS,
+                streamsTxIq = false,
+            ),
+        )
+    }
 }

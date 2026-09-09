@@ -558,7 +558,13 @@ class DriverSession(
                 val last = lastTxIqMs
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (!com.isaklab.isdrdrivers.core.TxWatchdogPolicy
-                        .shouldUnkey(pttOn, keyedAtMs, last, now)
+                        .shouldUnkeyFor(
+                            pttOn,
+                            keyedAtMs,
+                            last,
+                            now,
+                            streamsTxIq = radio !is CatControlCapable,
+                        )
                 ) {
                     continue
                 }
@@ -1000,7 +1006,7 @@ class DriverSession(
             DriverProto.CMD_SET_NARROWBAND -> false
             DriverProto.CMD_SET_TX_FREQUENCY,
             DriverProto.CMD_SET_PTT -> r is TransmitCapable
-            DriverProto.CMD_SET_TX_DRIVE,
+            DriverProto.CMD_SET_TX_DRIVE -> r is TxDriveCapable || r is CatControlCapable
             DriverProto.CMD_SET_PA_ENABLED -> r is TxDriveCapable
             DriverProto.CMD_SET_TX_TIMING -> r is TxTimingCapable
             DriverProto.CMD_SET_RECEIVER_COUNT,
@@ -1317,11 +1323,31 @@ class DriverSession(
                 // Clear first: an exception or a false result must not leave
                 // a previous successful tune authorizing the following PTT.
                 txFrequencyReady = false
-                val applied = (radio as TransmitCapable).setTxFrequency(hz)
-                if (!applied) {
-                    throw IllegalStateException(
-                        "TX frequency was not confirmed without changing RX",
-                    )
+                val r = radio ?: throw IllegalStateException("no radio is open")
+                if (r is CatControlCapable) {
+                    // CAT repeater/split state is configured atomically by
+                    // CMD_CAT_SET_REPEATER. The ordinary TX-frequency
+                    // command is therefore a simplex barrier: it may confirm
+                    // the current RX frequency, but must never rewrite VFO B,
+                    // split, or the repeater state behind that contract.
+                    val rxHz = r.frequencyHz()
+                    if (rxHz <= 0L) {
+                        throw IllegalStateException(
+                            "CAT RX frequency is unknown; TX frequency was not confirmed",
+                        )
+                    }
+                    if (hz != rxHz) {
+                        throw IllegalStateException(
+                            "CAT simplex TX frequency $hz does not match RX frequency $rxHz",
+                        )
+                    }
+                } else {
+                    val applied = (r as TransmitCapable).setTxFrequency(hz)
+                    if (!applied) {
+                        throw IllegalStateException(
+                            "TX frequency was not confirmed without changing RX",
+                        )
+                    }
                 }
                 txFrequencyReady = true
             }
@@ -1353,7 +1379,24 @@ class DriverSession(
                 }
             }
             DriverProto.CMD_SET_TX_DRIVE -> p.int.let { level ->
-                (radio as? TxDriveCapable)?.setTxDrive(level)
+                when (val r = radio) {
+                    is CatControlCapable -> {
+                        val applied = r.setCatControl(DriverProto.CATCTL_RF_POWER, level)
+                        send {
+                            frames.writeCatControlResult(
+                                DriverProto.CATCTL_RF_POWER,
+                                level,
+                                applied,
+                                superseded = false,
+                            )
+                        }
+                        if (!applied) {
+                            throw IllegalStateException("CAT RF power was not confirmed")
+                        }
+                    }
+                    is TxDriveCapable -> r.setTxDrive(level)
+                    else -> throw IllegalStateException("TX drive is unsupported")
+                }
             }
             DriverProto.CMD_SET_PA_ENABLED -> p.getBool().let { on ->
                 (radio as? TxDriveCapable)?.setPaEnabled(on)

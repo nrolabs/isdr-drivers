@@ -24,9 +24,10 @@ package com.isaklab.isdrdrivers.core
  * down — so the radio can sit KEYED for minutes, into an antenna, with no
  * operator present. That is a burnt PA and an occupied channel.
  *
- * Every path that keys PTT streams transmit samples continuously — voice,
- * digital, and the VNA sweep's carrier pump — so their absence is a sound
- * proxy for "the far end is gone".
+ * Radios whose modulation rides the IQ plane stream transmit samples
+ * continuously — voice, digital, and the VNA sweep's carrier pump — so their
+ * absence is a sound proxy for "the far end is gone". CAT rigs generate RF
+ * inside the radio and therefore use only the absolute key-down ceiling.
  *
  * Kept as a pure decision so the rule can be tested without a radio, a
  * socket or a clock: the plumbing around it cannot be. Register access triggered 
@@ -80,9 +81,27 @@ object TxWatchdogPolicy {
      * @param nowMs current monotonic time
      */
     fun shouldUnkey(pttOn: Boolean, keyedAtMs: Long, lastTxIqMs: Long, nowMs: Long): Boolean {
+        return shouldUnkeyFor(
+            pttOn = pttOn,
+            keyedAtMs = keyedAtMs,
+            lastTxIqMs = lastTxIqMs,
+            nowMs = nowMs,
+            streamsTxIq = true,
+        )
+    }
+
+    /** Apply the silence rule only when this radio's TX rides the IQ plane. */
+    fun shouldUnkeyFor(
+        pttOn: Boolean,
+        keyedAtMs: Long,
+        lastTxIqMs: Long,
+        nowMs: Long,
+        streamsTxIq: Boolean,
+    ): Boolean {
         if (!pttOn) return false
         // Hard ceiling first: it holds regardless of what the stream does.
         if (nowMs - keyedAtMs >= MAX_KEYED_MS) return true
+        if (!streamsTxIq) return false
         return if (lastTxIqMs == NOT_ARMED) {
             // Keyed and never streamed: a mode that keys without a stream of
             // its own gets a generous window, not immunity.
