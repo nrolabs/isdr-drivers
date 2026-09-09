@@ -49,6 +49,12 @@ class CivProtocolTest {
 
         // Zero is a legal frequency field.
         assertArrayEquals(bytes(0, 0, 0, 0, 0), P.toBcdLe(0, 5)!!)
+
+        val tenGhz = P.toBcdLe(10_368_100_000L, 6)!!
+        assertArrayEquals(bytes(0x00, 0x00, 0x10, 0x68, 0x03, 0x01), tenGhz)
+        assertEquals(10_368_100_000L, P.parseFrequency(tenGhz))
+        assertNull(P.parseFrequency(ByteArray(4)))
+        assertNull(P.parseFrequency(ByteArray(7)))
     }
 
     @Test
@@ -90,6 +96,15 @@ class CivProtocolTest {
         assertNull(P.toBcdBe2(10_000))
     }
 
+    @Test
+    fun `ic905 frequency uses the exact six byte wire field`() {
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0xAC, 0xE0, 0x05, 0x00, 0x00, 0x10, 0x68, 0x03, 0x01, 0xFD),
+            P.writeFrequency(0xAC, 10_368_100_000L)!!,
+        )
+        assertNull(P.writeFrequency(0xAC, 100_000_000_000L))
+    }
+
     // ---- frame building --------------------------------------------------------
 
     @Test
@@ -104,7 +119,7 @@ class CivProtocolTest {
     @Test
     fun `write frequency rejects out of field`() {
         assertNull(P.writeFrequency(0x94, -1))
-        assertNull(P.writeFrequency(0x94, 10_000_000_000L))
+        assertNull(P.writeFrequency(0x94, 100_000_000_000L))
     }
 
     @Test
@@ -132,6 +147,22 @@ class CivProtocolTest {
         )
         assertNull(P.writeMode(0x94, P.MODE_USB, 0))
         assertNull(P.writeMode(0x94, P.MODE_USB, 4))
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x26, 0x00, 0xFD),
+            P.readModeData(0x94),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x26, 0x00, 0x01, 0x01, 0x02, 0xFD),
+            P.writeModeData(0x94, P.MODE_USB, true, 2)!!,
+        )
+        assertEquals(
+            P.ModeState(P.MODE_USB, true, 2),
+            P.parseModeData(bytes(0x00, P.MODE_USB, 0x01, 0x02)),
+        )
+        assertEquals(P.ModeState(P.MODE_CW, false, 3), P.parseMode(bytes(P.MODE_CW, 3)))
+        assertNull(P.parseModeData(bytes(0x00, P.MODE_USB, 0x02, 0x02)))
+        assertNull(P.parseModeData(bytes(0x01, P.MODE_USB, 0x01, 0x02)))
+        assertNull(P.parseMode(bytes(P.MODE_USB, 0)))
         assertArrayEquals(
             bytes(0xFE, 0xFE, 0x94, 0xE0, 0x1C, 0x00, 0x01, 0xFD),
             P.setPtt(0x94, true),
@@ -178,6 +209,19 @@ class CivProtocolTest {
             bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x06, 0x02, 0x55, 0xFD),
             P.setLevel(0x94, P.SUB_LEVEL_NR, 255),
         )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x0A, 0x02, 0x55, 0xFD),
+            P.setLevel(0x94, P.SUB_LEVEL_RFPOWER, 255),
+        )
+        assertArrayEquals(
+            bytes(0xFE, 0xFE, 0x94, 0xE0, 0x14, 0x0A, 0xFD),
+            P.readLevel(0x94, P.SUB_LEVEL_RFPOWER),
+        )
+        assertEquals(255, P.parseLevel(bytes(0x0A, 0x02, 0x55), P.SUB_LEVEL_RFPOWER))
+        assertNull(P.parseLevel(bytes(0x0A, 0x02, 0x56), P.SUB_LEVEL_RFPOWER))
+        assertNull(P.parseLevel(bytes(0x01, 0x02, 0x55), P.SUB_LEVEL_RFPOWER))
+        assertNull(P.parseLevel(bytes(0x0A, 0x02), P.SUB_LEVEL_RFPOWER))
+        assertNull(P.parseLevel(bytes(0x0A, 0x0A, 0x00), P.SUB_LEVEL_RFPOWER))
 
         // Functions carry one plain data byte.
         assertArrayEquals(

@@ -20,6 +20,7 @@ import com.isaklab.libkenwoodk.KenwoodClient.Link
 import com.isaklab.libkenwoodk.KenwoodProtocol as P
 import com.isaklab.isdrproto.CatRepeater
 import com.isaklab.isdrproto.CatRepeaterConfig
+import com.isaklab.isdrproto.DriverProto
 import java.util.ArrayDeque
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -124,6 +125,19 @@ class KenwoodClientTest {
         h.on("OM0;", "OM02;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS44;")
+        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSO;", "BSO0;")
+    }
+
+    private fun scriptLanTs990(h: FakeRig) {
+        h.on("##CN;", "##CN1;")
+        h.on("##ID00705kenwoodadmin;", "##ID0;")
+        h.on("##ID75kenwoodadmin;", "##ID1;")
+        h.on("ID;", "ID023;")
+        h.on("FA;", "FA00007074000;")
+        h.on("OM0;", "OM01;")
+        h.on("BS3;", "BS30;")
+        h.on("BS4;", "BS42;")
         h.on("BSM0;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
     }
@@ -241,6 +255,13 @@ class KenwoodClientTest {
         assertEquals("TS-990S", c.modelName())
         assertEquals(1, h.writesOf("##ID00705kenwoodadmin;"))
         assertEquals(1, h.writesOf("##ID75kenwoodadmin;"))
+        assertEquals(20_000, c.sampleRateHz())
+        assertEquals(Pair(7_064_000L, 7_084_000L), c.scopeEdges())
+
+        h.on("BS4;", "BS42;")
+        c.setSampleRate(21_000)
+        assertEquals(20_000, c.sampleRateHz())
+        assertEquals(1, h.writesOf("BS42;"))
 
         h.on("FA;", "FA00007074000;")
         h.on("FA;", "FA00007074000;")
@@ -487,6 +508,58 @@ class KenwoodClientTest {
         // A CAT code with no OM equivalent is refused without traffic.
         assertFalse(c.setMode(6))
         assertEquals(0, h.writesOf("OM06;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `data modes map both ways and normal mode clears data`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        val data = DriverProto.CAT_MODE_DATA_FLAG
+        for ((requested, om) in listOf(
+            Pair(data or 0, P.MODE_LSB_D),
+            Pair(data or 1, P.MODE_USB_D),
+            Pair(data or 2, P.MODE_AM_D),
+            Pair(data or 5, P.MODE_FM_D),
+        )) {
+            val digit = om.toString(16).uppercase()
+            h.on("OM0;", "OM0$digit;")
+            assertTrue(c.setCatMode(requested))
+            assertEquals(1, h.writesOf("OM0$digit;"))
+            assertEquals(om, c.mode())
+            assertEquals(requested, c.currentCatMode())
+        }
+
+        h.on("OM0;", "OM02;")
+        assertTrue(c.setCatMode(1))
+        assertEquals(P.MODE_USB, c.mode())
+        assertEquals(1, c.currentCatMode())
+        c.disconnect()
+    }
+
+    @Test
+    fun `mode requires physical match and rejects unknown data combinations`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        val data = DriverProto.CAT_MODE_DATA_FLAG
+        h.on("OM0;", "OM02;")
+        assertFalse(c.setCatMode(data or 1))
+        assertEquals(1, h.writesOf("OM0D;"))
+        assertEquals(P.MODE_USB, c.mode())
+        assertEquals(1, c.currentCatMode())
+
+        waitUntil { h.writesOf("DD01;") == 1 }
+        val before = h.written().size
+        for (invalid in listOf(6, data or 3, data or 4, data or 7, 0x200 or 1)) {
+            assertFalse(c.setCatMode(invalid))
+        }
+        assertEquals(before, h.written().size)
         c.disconnect()
     }
 
@@ -756,6 +829,107 @@ class KenwoodClientTest {
         assertFalse(c.setControl(2, 256))
         assertFalse(c.setControl(13, -1))
         assertEquals(0, h.writesOf("RG256;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `ts890 rf power maps drive to watts and requires read back`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        h.on("PC;", "PC050;")
+        assertTrue(c.setControl(14, 128))
+        assertEquals(1, h.writesOf("PC050;"))
+        assertEquals(1, h.writesOf("PC;"))
+
+        h.on("PC;", "PC049;")
+        assertFalse(c.setControl(14, 128))
+        h.on("PC;", "?;")
+        assertFalse(c.setControl(14, 64))
+
+        h.on("PC;", "PC005;")
+        assertTrue(c.setControl(14, 0))
+        val before = h.written().size
+        assertFalse(c.setControl(14, -1))
+        assertFalse(c.setControl(14, 256))
+        assertEquals(before, h.written().size)
+        c.disconnect()
+    }
+
+    @Test
+    fun `ts990 rf power uses the two hundred watt model ceiling`() {
+        val h = FakeRig()
+        h.on("##CN;", "##CN1;")
+        h.on("##ID00705kenwoodadmin;", "##ID0;")
+        h.on("##ID75kenwoodadmin;", "##ID1;")
+        h.on("ID;", "ID023;")
+        h.on("FA;", "FA00007074000;")
+        h.on("OM0;", "OM01;")
+        h.on("BS3;", "BS30;")
+        h.on("BS4;", "BS42;")
+        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSO;", "BSO0;")
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        h.on("PC;", "PC200;")
+        assertTrue(c.setControl(14, 255))
+        assertEquals(1, h.writesOf("PC200;"))
+        assertEquals(1, h.writesOf("PC;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `ts990 receive controls select and confirm main band`() {
+        val h = FakeRig()
+        scriptLanTs990(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+
+        h.on("FL00;", "FL001;")
+        assertTrue(c.setControl(1, 2))
+        assertEquals(1, h.writesOf("FL001;"))
+
+        h.on("RG0;", "RG0042;")
+        assertTrue(c.setControl(2, 42))
+        assertEquals(1, h.writesOf("RG0042;"))
+        h.on("SQ0;", "SQ0043;")
+        assertTrue(c.setControl(3, 43))
+        assertEquals(1, h.writesOf("SQ0043;"))
+        h.on("AG0;", "AG0044;")
+        assertTrue(c.setControl(13, 44))
+        assertEquals(1, h.writesOf("AG0044;"))
+
+        h.on("NR0;", "NR01;")
+        h.on("RL10;", "RL1001;")
+        assertTrue(c.setControl(4, 1))
+        assertEquals(1, h.writesOf("NR01;"))
+        assertEquals(1, h.writesOf("RL1001;"))
+        h.on("NB10;", "NB101;")
+        assertTrue(c.setControl(5, 1))
+        assertEquals(1, h.writesOf("NB101;"))
+        h.on("BC0;", "BC01;")
+        assertTrue(c.setControl(6, 1))
+        assertEquals(1, h.writesOf("BC01;"))
+        h.on("GC0;", "GC03;")
+        assertTrue(c.setControl(7, 1))
+        assertEquals(1, h.writesOf("GC03;"))
+
+        // TS-990S PA query is bare; the set and answer still carry Main P1=0.
+        h.on("PA;", "PA01;")
+        assertTrue(c.setControl(8, 1))
+        assertEquals(1, h.writesOf("PA01;"))
+        h.on("RA0;", "RA02;")
+        assertTrue(c.setControl(9, 10))
+        assertEquals(1, h.writesOf("RA02;"))
+
+        h.on("OM0;", "OM03;")
+        assertTrue(c.setMode(3))
+        h.on("SL0;", "SL000;")
+        assertTrue(c.setControl(12, 50))
+        assertEquals(1, h.writesOf("SL000;"))
         c.disconnect()
     }
 

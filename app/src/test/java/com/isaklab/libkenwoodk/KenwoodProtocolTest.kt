@@ -128,17 +128,28 @@ class KenwoodProtocolTest {
         assertNull(P.parseSm("SM0071"))
         assertNull(P.parseSm("SM007"))
 
-        assertEquals("AG255;", P.setAg(255))
-        assertEquals("AG000;", P.setAg(0))
-        assertEquals("RG128;", P.setRg(128))
-        assertEquals("SQ042;", P.setSq(42))
-        assertEquals("AG;", P.getAg())
-        assertEquals("RG;", P.getRg())
-        assertEquals("SQ;", P.getSq())
-        assertEquals(255, P.parseLevel("AG255", "AG"))
-        assertEquals(0, P.parseLevel("SQ000", "SQ"))
-        assertNull(P.parseLevel("AG256", "AG"))
-        assertNull(P.parseLevel("AG25", "AG"))
+        assertEquals("AG255;", P.setAg(null, 255))
+        assertEquals("AG000;", P.setAg(null, 0))
+        assertEquals("RG128;", P.setRg(null, 128))
+        assertEquals("SQ042;", P.setSq(null, 42))
+        assertEquals("AG;", P.getAg(null))
+        assertEquals("RG;", P.getRg(null))
+        assertEquals("SQ;", P.getSq(null))
+        assertEquals(255, P.parseLevel("AG255", "AG", null))
+        assertEquals(0, P.parseLevel("SQ000", "SQ", null))
+        assertNull(P.parseLevel("AG256", "AG", null))
+        assertNull(P.parseLevel("AG25", "AG", null))
+
+        assertEquals("PC005;", P.setPc(5))
+        assertEquals("PC100;", P.setPc(100))
+        assertEquals("PC200;", P.setPc(200))
+        assertNull(P.setPc(4))
+        assertNull(P.setPc(201))
+        assertEquals("PC;", P.getPc())
+        assertEquals(5, P.parsePc("PC005"))
+        assertEquals(200, P.parsePc("PC200"))
+        assertNull(P.parsePc("PC20"))
+        assertNull(P.parsePc("PC20X"))
 
         assertEquals("PS;", P.getPs())
         assertEquals(true, P.parsePs("PS1"))
@@ -429,9 +440,9 @@ class KenwoodProtocolTest {
         assertEquals(0, P.parseBs4("BS40"))
         assertEquals(6, P.parseBs4("BS46"))
         assertNull(P.parseBs4("BS47"))
-        assertEquals(5_000L, P.bs4SpanHz(0))
-        assertEquals(500_000L, P.bs4SpanHz(6))
-        assertNull(P.bs4SpanHz(7))
+        assertEquals(25_000L, KenwoodModels.TS890_BS4_SPANS_HZ[2])
+        assertEquals(20_000L, KenwoodModels.TS990_BS4_SPANS_HZ[2])
+        assertEquals(500_000L, KenwoodModels.TS990_BS4_SPANS_HZ[6])
 
         assertEquals("BSM0;", P.getBsm0())
         assertEquals(Pair(7_000_000L, 7_300_000L), P.parseBsm0("BSM00700000007300000"))
@@ -484,81 +495,81 @@ class KenwoodProtocolTest {
 
     @Test
     fun `agc gc command exact ascii`() {
-        assertEquals("GC;", P.getGc())
-        assertEquals("GC0;", P.setGc(0))
-        assertEquals("GC1;", P.setGc(1))
-        assertEquals("GC2;", P.setGc(2))
-        assertEquals("GC3;", P.setGc(3))
+        assertEquals("GC;", P.getGc(null))
+        assertEquals("GC0;", P.setGc(null, 0))
+        assertEquals("GC1;", P.setGc(null, 1))
+        assertEquals("GC2;", P.setGc(null, 2))
+        assertEquals("GC3;", P.setGc(null, 3))
         // 4 (OFF-to-ON) is set-only sugar the driver never sends.
-        assertNull(P.setGc(4))
-        assertEquals(0, P.parseGc("GC0"))
-        assertEquals(3, P.parseGc("GC3"))
-        assertNull(P.parseGc("GC4"))
-        assertNull(P.parseGc("GC"))
-        assertNull(P.parseGc("GC10"))
+        assertNull(P.setGc(null, 4))
+        assertEquals(0, P.parseGc("GC0", null))
+        assertEquals(3, P.parseGc("GC3", null))
+        assertNull(P.parseGc("GC4", null))
+        assertNull(P.parseGc("GC", null))
+        assertNull(P.parseGc("GC10", null))
     }
 
     @Test
     fun `noise reduction nr and rl1 exact ascii`() {
-        assertEquals("NR;", P.getNr())
-        assertEquals("NR0;", P.setNr(0))
-        assertEquals("NR1;", P.setNr(1))
-        assertEquals("NR2;", P.setNr(2))
-        assertNull(P.setNr(3))
-        assertEquals(2, P.parseNr("NR2"))
-        assertNull(P.parseNr("NR3"))
+        assertEquals("NR;", P.getNr(null))
+        assertEquals("NR0;", P.setNr(null, 0))
+        assertEquals("NR1;", P.setNr(null, 1))
+        assertEquals("NR2;", P.setNr(null, 2))
+        assertNull(P.setNr(null, 3))
+        assertEquals(2, P.parseNr("NR2", null))
+        assertNull(P.parseNr("NR3", null))
 
-        assertEquals("RL1;", P.getRl1())
-        assertEquals("RL101;", P.setRl1(1))
-        assertEquals("RL110;", P.setRl1(10))
-        assertNull(P.setRl1(0))
-        assertNull(P.setRl1(11))
-        assertEquals(7, P.parseRl1("RL107"))
-        assertNull(P.parseRl1("RL100"))
-        assertNull(P.parseRl1("RL111"))
-        assertNull(P.parseRl1("RL17"))
+        assertEquals("RL1;", P.getRl1(null))
+        assertEquals("RL101;", P.setRl1(null, 1))
+        assertEquals("RL110;", P.setRl1(null, 10))
+        assertNull(P.setRl1(null, 0))
+        assertNull(P.setRl1(null, 11))
+        assertEquals(7, P.parseRl1("RL107", null))
+        assertNull(P.parseRl1("RL100", null))
+        assertNull(P.parseRl1("RL111", null))
+        assertNull(P.parseRl1("RL17", null))
     }
 
     @Test
     fun `noise blanker nb1 exact ascii`() {
-        assertEquals("NB1;", P.getNb1())
-        assertEquals("NB10;", P.setNb1(false))
-        assertEquals("NB11;", P.setNb1(true))
-        assertEquals(false, P.parseNb1("NB10"))
-        assertEquals(true, P.parseNb1("NB11"))
-        assertNull(P.parseNb1("NB1"))
-        assertNull(P.parseNb1("NB111"))
+        assertEquals("NB1;", P.getNb1(null))
+        assertEquals("NB10;", P.setNb1(null, false))
+        assertEquals("NB11;", P.setNb1(null, true))
+        assertEquals(false, P.parseNb1("NB10", null))
+        assertEquals(true, P.parseNb1("NB11", null))
+        assertNull(P.parseNb1("NB1", null))
+        assertNull(P.parseNb1("NB111", null))
     }
 
     @Test
     fun `beat cancel bc exact ascii`() {
-        assertEquals("BC;", P.getBc())
-        assertEquals("BC0;", P.setBc(0))
-        assertEquals("BC1;", P.setBc(1))
-        assertEquals("BC2;", P.setBc(2))
-        assertNull(P.setBc(3))
-        assertEquals(1, P.parseBc("BC1"))
-        assertNull(P.parseBc("BC3"))
+        assertEquals("BC;", P.getBc(null))
+        assertEquals("BC0;", P.setBc(null, 0))
+        assertEquals("BC1;", P.setBc(null, 1))
+        assertEquals("BC2;", P.setBc(null, 2))
+        assertNull(P.setBc(null, 3))
+        assertEquals(1, P.parseBc("BC1", null))
+        assertNull(P.parseBc("BC3", null))
     }
 
     @Test
     fun `preamp pa exact ascii`() {
-        assertEquals("PA;", P.getPa())
-        assertEquals("PA0;", P.setPa(0))
-        assertEquals("PA2;", P.setPa(2))
-        assertNull(P.setPa(3))
-        assertEquals(2, P.parsePa("PA2"))
-        assertNull(P.parsePa("PA3"))
+        assertEquals("PA;", P.getPa(null))
+        assertEquals("PA0;", P.setPa(null, 0))
+        assertEquals("PA2;", P.setPa(null, 2))
+        assertNull(P.setPa(null, 3))
+        assertEquals(2, P.parsePa("PA2", null))
+        assertNull(P.parsePa("PA3", null))
     }
 
     @Test
     fun `attenuator ra codes and db snapping`() {
-        assertEquals("RA;", P.getRa())
-        assertEquals("RA0;", P.setRa(0))
-        assertEquals("RA3;", P.setRa(3))
-        assertNull(P.setRa(4))
-        assertEquals(2, P.parseRa("RA2"))
-        assertNull(P.parseRa("RA4"))
+        assertEquals("RA;", P.getRa(null))
+        assertEquals("RA0;", P.setRa(null, 0))
+        assertEquals("RA3;", P.setRa(null, 3))
+        assertNull(P.setRa(null, 4))
+        assertEquals(2, P.parseRa("RA2", null))
+        assertNull(P.parseRa("RA4", null))
         // Steps 0/6/12/18 dB; snapping picks the nearest, ties round down.
         assertEquals(0, P.raCodeForDb(0))
         assertEquals(0, P.raCodeForDb(2))
@@ -571,32 +582,32 @@ class KenwoodProtocolTest {
 
     @Test
     fun `receive filter fl0 exact ascii`() {
-        assertEquals("FL0;", P.getFl0())
-        assertEquals("FL00;", P.setFl0(0))
-        assertEquals("FL01;", P.setFl0(1))
-        assertEquals("FL02;", P.setFl0(2))
-        assertNull(P.setFl0(3))
+        assertEquals("FL0;", P.getFl0(null))
+        assertEquals("FL00;", P.setFl0(null, 0))
+        assertEquals("FL01;", P.setFl0(null, 1))
+        assertEquals("FL02;", P.setFl0(null, 2))
+        assertNull(P.setFl0(null, 3))
         // The answer carries the trailing 270 Hz-option digit; a bare
         // selection digit is also accepted.
-        assertEquals(1, P.parseFl0("FL011"))
-        assertEquals(2, P.parseFl0("FL020"))
-        assertEquals(0, P.parseFl0("FL00"))
-        assertNull(P.parseFl0("FL03"))
-        assertNull(P.parseFl0("FL012x"))
-        assertNull(P.parseFl0("FL0"))
-        assertNull(P.parseFl0("FL015"))
+        assertEquals(1, P.parseFl0("FL011", null))
+        assertEquals(2, P.parseFl0("FL020", null))
+        assertEquals(0, P.parseFl0("FL00", null))
+        assertNull(P.parseFl0("FL03", null))
+        assertNull(P.parseFl0("FL012x", null))
+        assertNull(P.parseFl0("FL0", null))
+        assertNull(P.parseFl0("FL015", null))
     }
 
     @Test
     fun `sl width ladders snap per mode`() {
-        assertEquals("SL0;", P.getSl0())
-        assertEquals("SL000;", P.setSl0(0))
-        assertEquals("SL018;", P.setSl0(18))
-        assertEquals("SL035;", P.setSl0(35))
-        assertNull(P.setSl0(36))
-        assertEquals(7, P.parseSl0("SL007"))
-        assertNull(P.parseSl0("SL036"))
-        assertNull(P.parseSl0("SL07"))
+        assertEquals("SL0;", P.getSl0(null))
+        assertEquals("SL000;", P.setSl0(null, 0))
+        assertEquals("SL018;", P.setSl0(null, 18))
+        assertEquals("SL035;", P.setSl0(null, 35))
+        assertNull(P.setSl0(null, 36))
+        assertEquals(7, P.parseSl0("SL007", null))
+        assertNull(P.parseSl0("SL036", null))
+        assertNull(P.parseSl0("SL07", null))
 
         // CW ladder: code = index into the documented width table.
         assertEquals(Pair(0, 50), P.slWidthCode(P.MODE_CW, 50))
@@ -614,6 +625,62 @@ class KenwoodProtocolTest {
         assertNull(P.slWidthCode(P.MODE_AM, 6000))
         assertNull(P.slWidthCode(P.MODE_FM, 10_000))
         assertNull(P.slWidthCode(P.MODE_CW, 0))
+    }
+
+    @Test
+    fun `ts990 main band receive controls are byte exact`() {
+        assertEquals("AG0;", P.getAg(0))
+        assertEquals("AG0128;", P.setAg(0, 128))
+        assertEquals(128, P.parseLevel("AG0128", "AG", 0))
+        assertEquals("RG0;", P.getRg(0))
+        assertEquals("RG0042;", P.setRg(0, 42))
+        assertEquals(42, P.parseLevel("RG0042", "RG", 0))
+        assertEquals("SQ0;", P.getSq(0))
+        assertEquals("SQ0255;", P.setSq(0, 255))
+        assertEquals(255, P.parseLevel("SQ0255", "SQ", 0))
+
+        assertEquals("GC0;", P.getGc(0))
+        assertEquals("GC03;", P.setGc(0, 3))
+        assertEquals(3, P.parseGc("GC03", 0))
+        assertEquals("NR0;", P.getNr(0))
+        assertEquals("NR01;", P.setNr(0, 1))
+        assertEquals(1, P.parseNr("NR01", 0))
+        assertEquals("RL10;", P.getRl1(0))
+        assertEquals("RL1007;", P.setRl1(0, 7))
+        assertEquals(7, P.parseRl1("RL1007", 0))
+        assertEquals("NB10;", P.getNb1(0))
+        assertEquals("NB101;", P.setNb1(0, true))
+        assertEquals(true, P.parseNb1("NB101", 0))
+        assertEquals("BC0;", P.getBc(0))
+        assertEquals("BC01;", P.setBc(0, 1))
+        assertEquals(1, P.parseBc("BC01", 0))
+
+        // TS-990S reads PA without a selector, but sets and answers with P1.
+        assertEquals("PA;", P.getPa(0))
+        assertEquals("PA01;", P.setPa(0, 1))
+        assertEquals(1, P.parsePa("PA01", 0))
+        assertEquals("RA0;", P.getRa(0))
+        assertEquals("RA02;", P.setRa(0, 2))
+        assertEquals(2, P.parseRa("RA02", 0))
+        assertEquals("FL00;", P.getFl0(0))
+        assertEquals("FL001;", P.setFl0(0, 1))
+        assertEquals(1, P.parseFl0("FL001", 0))
+
+        // TS-890S setting-type 0 and TS-990S Main band 0 share these bytes.
+        assertEquals("SL0;", P.getSl0(0))
+        assertEquals("SL007;", P.setSl0(0, 7))
+        assertEquals(7, P.parseSl0("SL007", 0))
+
+        // A TS-890S-shaped answer cannot confirm a TS-990S transaction.
+        assertNull(P.parseLevel("AG128", "AG", 0))
+        assertNull(P.parseGc("GC3", 0))
+        assertNull(P.parseNr("NR1", 0))
+        assertNull(P.parseRl1("RL107", 0))
+        assertNull(P.parseNb1("NB11", 0))
+        assertNull(P.parseBc("BC1", 0))
+        assertNull(P.parsePa("PA1", 0))
+        assertNull(P.parseRa("RA2", 0))
+        assertNull(P.parseFl0("FL011", 0))
     }
 
     @Test

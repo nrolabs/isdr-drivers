@@ -18,6 +18,7 @@ package com.isaklab.libcivk
 import com.isaklab.libcivk.CivProtocol as P
 import com.isaklab.isdrproto.CatRepeater
 import com.isaklab.isdrproto.CatRepeaterConfig
+import com.isaklab.isdrproto.DriverProto
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -25,6 +26,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -52,6 +54,7 @@ class CivClientTest {
         const val CATCTL_PBT_OUT = 11
         const val CATCTL_FILTER_WIDTH = 12
         const val CATCTL_AF_GAIN = 13
+        const val CATCTL_RF_POWER = 14
     }
 
     /**
@@ -154,7 +157,10 @@ class CivClientTest {
     private fun scriptConnect(rig: FakeRig) {
         rig.reply(P.CMD_READ_ID, byteArrayOf(P.SUB_ID.toByte(), RIG.toByte()))
         rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
-        rig.reply(P.CMD_READ_MODE, byteArrayOf(P.MODE_USB.toByte(), 0x01))
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 1),
+        )
         rig.ack(P.CMD_SCOPE) // scope on
         rig.ack(P.CMD_SCOPE) // waveform output on
     }
@@ -242,6 +248,45 @@ class CivClientTest {
         } catch (_: IllegalStateException) {
         }
         assertEquals(7_074_000L, c.frequencyHz())
+        c.disconnect()
+    }
+
+    @Test
+    fun `ic905 tunes and tracks the ten gigahertz band`() {
+        val address = CivModels.ADDR_IC905
+        val initial = 10_368_000_000L
+        val target = 10_368_100_000L
+        val rig = FakeRig(echo = true, address = address)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, address))
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(initial, 6)!!)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 1),
+        )
+        rig.ack(P.CMD_SCOPE)
+        rig.ack(P.CMD_SCOPE)
+        val (c, _) = makeClient(rig, address)
+        assertTrue(connect(c))
+        assertEquals(initial, c.frequencyHz())
+
+        rig.ack(P.CMD_WRITE_FREQ)
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(target, 6)!!)
+        c.setFrequency(target)
+        assertEquals(target, c.frequencyHz())
+        val write = rig.writtenFrames().last { frame ->
+            frame.size > 4 && (frame[4].toInt() and 0xFF) == P.CMD_WRITE_FREQ
+        }
+        assertArrayEquals(P.writeFrequency(address, target)!!, write)
+
+        rig.pushUnsolicited(
+            bytes(0xFE, 0xFE, 0x00, address, P.CMD_TRANSCEIVE_FREQ) +
+                P.toBcdLe(10_450_000_000L, 6)!! + bytes(0xFD),
+        )
+        val deadline = System.currentTimeMillis() + 1000
+        while (c.frequencyHz() != 10_450_000_000L && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+        }
+        assertEquals(10_450_000_000L, c.frequencyHz())
         c.disconnect()
     }
 
@@ -531,16 +576,57 @@ class CivClientTest {
     }
 
     @Test
-    fun `set sample rate snaps to a scope span`() {
+    fun `scope span uses the exact common model ladder`() {
         val rig = FakeRig(echo = true)
         scriptConnect(rig)
         val (c, _) = makeClient(rig, RIG)
         assertTrue(connect(c))
 
         rig.ack(P.CMD_SCOPE)
-        c.setSampleRate(300_000)
-        assertEquals(250_000, c.sampleRateHz())
+        c.setSampleRate(2_500)
+        assertEquals(2_500, c.sampleRateHz())
+        val before = rig.writesOf(P.CMD_SCOPE)
+        assertThrows(IllegalArgumentException::class.java) { c.setSampleRate(300_000) }
+        assertThrows(IllegalArgumentException::class.java) { c.setSampleRate(1_000_000) }
+        assertEquals(before, rig.writesOf(P.CMD_SCOPE))
         c.disconnect()
+    }
+
+    @Test
+    fun `extended scope spans are model specific`() {
+        fun connectedAt(address: Int): Pair<CivClient, FakeRig> {
+            val rig = FakeRig(echo = true, address = address)
+            rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, address))
+            rig.reply(P.CMD_READ_FREQ, P.toBcdLe(145_500_000, 5)!!)
+            if (CivModels.supportsModeData(address)) {
+                rig.reply(
+                    P.CMD_MODE_DATA,
+                    bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_FM, 0, 1),
+                )
+            } else {
+                rig.reply(P.CMD_READ_MODE, bytes(P.MODE_FM, 1))
+            }
+            rig.ack(P.CMD_SCOPE)
+            rig.ack(P.CMD_SCOPE)
+            val (client, _) = makeClient(rig, address)
+            assertTrue(connect(client))
+            return Pair(client, rig)
+        }
+
+        val (r8600, r8600Rig) = connectedAt(CivModels.ADDR_ICR8600)
+        r8600Rig.ack(P.CMD_SCOPE)
+        r8600.setSampleRate(2_500_000)
+        assertEquals(2_500_000, r8600.sampleRateHz())
+        assertThrows(IllegalArgumentException::class.java) { r8600.setSampleRate(5_000_000) }
+        r8600.disconnect()
+
+        val (ic905, ic905Rig) = connectedAt(CivModels.ADDR_IC905)
+        ic905Rig.ack(P.CMD_SCOPE)
+        ic905.setSampleRate(25_000_000)
+        assertEquals(25_000_000, ic905.sampleRateHz())
+        ic905.disconnect()
+
+        assertEquals(null, CivModels.scopeCaps(CivModels.ADDR_IC7851))
     }
 
     // ---- receive controls (CATCTL_*) ----------------------------------------
@@ -578,6 +664,57 @@ class CivClientTest {
         val before = rig.writesOf(P.CMD_LEVEL)
         assertFalse(c.setControl(CATCTL_RF_GAIN, 256))
         assertFalse(c.setControl(CATCTL_RF_GAIN, -1))
+        assertEquals(before, rig.writesOf(P.CMD_LEVEL))
+        c.disconnect()
+    }
+
+    @Test
+    fun `rf power is accepted only after exact physical read back`() {
+        val (c, rig) = connectedClient()
+
+        rig.ack(P.CMD_LEVEL)
+        rig.reply(
+            P.CMD_LEVEL,
+            bytes(P.SUB_LEVEL_RFPOWER, 0x02, 0x55),
+        )
+        assertTrue(c.setControl(CATCTL_RF_POWER, 255))
+        val frames = rig.writtenFrames()
+        val set = bytes(0xFE, 0xFE, RIG, 0xE0, 0x14, 0x0A, 0x02, 0x55, 0xFD)
+        val read = bytes(0xFE, 0xFE, RIG, 0xE0, 0x14, 0x0A, 0xFD)
+        assertTrue(frames.indexOfFirst { it.contentEquals(set) } >= 0)
+        assertTrue(
+            frames.indexOfFirst { it.contentEquals(read) } >
+                frames.indexOfFirst { it.contentEquals(set) },
+        )
+
+        rig.ack(P.CMD_LEVEL)
+        rig.reply(P.CMD_LEVEL, bytes(P.SUB_LEVEL_RFPOWER, 0x01, 0x27))
+        assertFalse(c.setControl(CATCTL_RF_POWER, 128))
+
+        rig.nak(P.CMD_LEVEL)
+        assertFalse(c.setControl(CATCTL_RF_POWER, 64))
+        val before = rig.writesOf(P.CMD_LEVEL)
+        assertFalse(c.setControl(CATCTL_RF_POWER, -1))
+        assertFalse(c.setControl(CATCTL_RF_POWER, 256))
+        assertEquals(before, rig.writesOf(P.CMD_LEVEL))
+        c.disconnect()
+    }
+
+    @Test
+    fun `receive only icom refuses rf power without wire traffic`() {
+        val rig = FakeRig(echo = true, address = CivModels.ADDR_ICR8600)
+        rig.reply(
+            P.CMD_READ_ID,
+            bytes(P.SUB_ID, CivModels.ADDR_ICR8600),
+        )
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_USB, 0x01))
+        rig.ack(P.CMD_SCOPE)
+        rig.ack(P.CMD_SCOPE)
+        val (c, _) = makeClient(rig, CivModels.ADDR_ICR8600)
+        assertTrue(connect(c))
+        val before = rig.writesOf(P.CMD_LEVEL)
+        assertFalse(c.setControl(CATCTL_RF_POWER, 128))
         assertEquals(before, rig.writesOf(P.CMD_LEVEL))
         c.disconnect()
     }
@@ -738,17 +875,49 @@ class CivClientTest {
     @Test
     fun `fil still rides the mode write and unknown ids are refused`() {
         val (c, rig) = connectedClient()
-        rig.ack(P.CMD_WRITE_MODE)
-        assertTrue(c.setControl(CATCTL_FIL, 2))
-        assertArrayEquals(
-            bytes(0xFE, 0xFE, RIG, 0xE0, 0x06, P.MODE_USB, 0x02, 0xFD),
-            rig.lastWritten(),
+        rig.ack(P.CMD_MODE_DATA)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 2),
         )
+        assertTrue(c.setControl(CATCTL_FIL, 2))
+        val modeWrite = P.writeModeData(RIG, P.MODE_USB, false, 2)!!
+        assertTrue(rig.writtenFrames().any { it.contentEquals(modeWrite) })
 
         val total = rig.totalWrites()
         assertFalse(c.setControl(99, 1))
         assertFalse(c.setControl(0, 1))
         assertEquals(total, rig.totalWrites())
+        c.disconnect()
+    }
+
+    @Test
+    fun `data modes require exact selected vfo read back`() {
+        val (c, rig) = connectedClient()
+        for (base in intArrayOf(P.MODE_LSB, P.MODE_USB, P.MODE_AM, P.MODE_FM)) {
+            val requested = base or DriverProto.CAT_MODE_DATA_FLAG
+            rig.ack(P.CMD_MODE_DATA)
+            rig.reply(
+                P.CMD_MODE_DATA,
+                bytes(P.SUB_MODE_DATA_SELECTED, base, 1, 1),
+            )
+            assertTrue(c.setCatMode(requested))
+            assertEquals(requested, c.currentCatMode())
+            val expected = P.writeModeData(RIG, base, true, 1)!!
+            assertTrue(rig.writtenFrames().any { it.contentEquals(expected) })
+        }
+
+        rig.ack(P.CMD_MODE_DATA)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 2),
+        )
+        assertFalse(c.setCatMode(P.MODE_USB or DriverProto.CAT_MODE_DATA_FLAG))
+        assertEquals(P.MODE_USB, c.currentCatMode())
+
+        val before = rig.totalWrites()
+        assertFalse(c.setCatMode(0x200 or P.MODE_USB))
+        assertEquals(before, rig.totalWrites())
         c.disconnect()
     }
 
