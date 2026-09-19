@@ -143,12 +143,17 @@ class CivClientTest {
         val status = ArrayList<Pair<Boolean, String>>()
     }
 
-    private fun makeClient(rig: FakeRig, addr: Int): Pair<CivClient, Captured> {
+    private fun makeClient(
+        rig: FakeRig,
+        addr: Int,
+        requiredReportedCivAddress: Int? = null,
+    ): Pair<CivClient, Captured> {
         val cap = Captured()
         val client = CivClient(
             rig, addr,
             { spectrum, iq -> synchronized(cap) { cap.spectra.add(Pair(spectrum.copyOf(), iq.size)) } },
             { up, msg -> synchronized(cap) { cap.status.add(Pair(up, msg)) } },
+            requiredReportedCivAddress,
         )
         return Pair(client, cap)
     }
@@ -208,6 +213,86 @@ class CivClientTest {
         assertEquals("IC-7300", c.modelName())
         assertEquals(2, rig.writesOf(P.CMD_SCOPE))
         assertEquals(listOf(Pair(true, "IC-7300")), cap.status)
+        c.disconnect()
+    }
+
+    @Test
+    fun `required reported address match connects before reading state`() {
+        val rig = FakeRig(echo = true)
+        scriptConnect(rig)
+        val (c, cap) = makeClient(rig, RIG, requiredReportedCivAddress = RIG)
+
+        assertTrue(connect(c))
+        assertEquals(listOf(Pair(true, "IC-7300")), cap.status)
+        assertEquals(1, rig.writesOf(P.CMD_READ_ID))
+        assertEquals(1, rig.writesOf(P.CMD_READ_FREQ))
+        assertEquals(2, rig.writesOf(P.CMD_SCOPE))
+        c.disconnect()
+    }
+
+    @Test
+    fun `required reported address mismatch refuses before state or scope`() {
+        val rig = FakeRig(echo = true)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, 0xA4))
+        val (c, cap) = makeClient(rig, RIG, requiredReportedCivAddress = RIG)
+
+        assertFalse(connect(c))
+        assertEquals(1, rig.totalWrites())
+        assertEquals(1, rig.writesOf(P.CMD_READ_ID))
+        assertEquals(0, rig.writesOf(P.CMD_READ_FREQ))
+        assertEquals(0, rig.writesOf(P.CMD_SCOPE))
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertFalse(status[0].first)
+        assertTrue(status[0].second, status[0].second.contains("address mismatch"))
+        assertTrue(status[0].second, status[0].second.contains("0x94"))
+        assertTrue(status[0].second, status[0].second.contains("0xA4"))
+    }
+
+    @Test
+    fun `required reported address rejects malformed identity before state`() {
+        val rig = FakeRig(echo = true)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID))
+        val (c, cap) = makeClient(rig, RIG, requiredReportedCivAddress = RIG)
+
+        assertFalse(connect(c))
+        assertEquals(1, rig.totalWrites())
+        assertEquals(0, rig.writesOf(P.CMD_READ_FREQ))
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertTrue(status[0].second, status[0].second.contains("malformed CI-V"))
+    }
+
+    @Test
+    fun `required reported address refuses a silent port without state traffic`() {
+        val rig = FakeRig(echo = false)
+        val (c, cap) = makeClient(rig, RIG, requiredReportedCivAddress = RIG)
+
+        assertFalse(connect(c))
+        assertEquals(3, rig.writesOf(P.CMD_READ_ID))
+        assertEquals(3, rig.totalWrites())
+        assertEquals(0, rig.writesOf(P.CMD_READ_FREQ))
+        assertEquals(0, rig.writesOf(P.CMD_SCOPE))
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertTrue(status[0].second, status[0].second.contains("did not answer"))
+        assertTrue(status[0].second, status[0].second.contains("0x94"))
+    }
+
+    @Test
+    fun `generic identity mode preserves legacy nonempty reply compatibility`() {
+        val rig = FakeRig(echo = true)
+        // Generic discovery historically required only a correlated reply.
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID))
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
+        rig.reply(P.CMD_MODE_DATA, bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 1))
+        rig.ack(P.CMD_SCOPE)
+        rig.ack(P.CMD_SCOPE)
+        val (c, cap) = makeClient(rig, RIG)
+
+        assertTrue(connect(c))
+        assertEquals(listOf(Pair(true, "IC-7300")), cap.status)
+        assertEquals(14_074_000L, c.frequencyHz())
         c.disconnect()
     }
 
@@ -888,6 +973,83 @@ class CivClientTest {
         assertFalse(c.setControl(99, 1))
         assertFalse(c.setControl(0, 1))
         assertEquals(total, rig.totalWrites())
+        c.disconnect()
+    }
+
+    @Test
+    fun `fil requires the physical filter read back to match`() {
+        val (c, rig) = connectedClient()
+        rig.ack(P.CMD_MODE_DATA)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 3),
+        )
+
+        assertFalse(c.setControl(CATCTL_FIL, 2))
+        assertEquals(P.MODE_USB, c.currentCatMode())
+        assertTrue(
+            rig.writtenFrames().any {
+                it.contentEquals(P.writeModeData(RIG, P.MODE_USB, false, 2)!!)
+            },
+        )
+        c.disconnect()
+    }
+
+    @Test
+    fun `legacy mode reply without filter never confirms FIL`() {
+        val address = 0x5E
+        val rig = FakeRig(echo = true, address = address)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, address))
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_USB))
+        val (c, _) = makeClient(rig, address)
+        assertTrue(connect(c))
+
+        rig.ack(P.CMD_WRITE_MODE)
+        rig.reply(P.CMD_READ_MODE, bytes(P.MODE_USB))
+        assertFalse(c.setControl(CATCTL_FIL, 2))
+        assertEquals(P.MODE_USB, c.currentCatMode())
+        assertTrue(
+            rig.writtenFrames().any {
+                it.contentEquals(P.writeMode(address, P.MODE_USB, 2)!!)
+            },
+        )
+        c.disconnect()
+    }
+
+    @Test
+    fun `ic7851 reads and confirms DATA state through command 26`() {
+        val address = CivModels.ADDR_IC7851
+        val rig = FakeRig(echo = true, address = address)
+        rig.reply(P.CMD_READ_ID, bytes(P.SUB_ID, address))
+        rig.reply(P.CMD_READ_FREQ, P.toBcdLe(14_074_000, 5)!!)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 1, 2),
+        )
+        val (c, _) = makeClient(rig, address)
+        assertTrue(connect(c))
+        assertEquals(P.MODE_USB or DriverProto.CAT_MODE_DATA_FLAG, c.currentCatMode())
+
+        rig.ack(P.CMD_MODE_DATA)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 0, 2),
+        )
+        assertTrue(c.setCatMode(P.MODE_USB))
+        assertTrue(
+            rig.writtenFrames().any {
+                it.contentEquals(P.writeModeData(address, P.MODE_USB, false, 2)!!)
+            },
+        )
+
+        rig.ack(P.CMD_MODE_DATA)
+        rig.reply(
+            P.CMD_MODE_DATA,
+            bytes(P.SUB_MODE_DATA_SELECTED, P.MODE_USB, 1, 2),
+        )
+        assertTrue(c.setCatMode(P.MODE_USB or DriverProto.CAT_MODE_DATA_FLAG))
+        assertEquals(P.MODE_USB or DriverProto.CAT_MODE_DATA_FLAG, c.currentCatMode())
         c.disconnect()
     }
 

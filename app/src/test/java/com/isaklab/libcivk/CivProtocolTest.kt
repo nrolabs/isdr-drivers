@@ -159,7 +159,10 @@ class CivProtocolTest {
             P.ModeState(P.MODE_USB, true, 2),
             P.parseModeData(bytes(0x00, P.MODE_USB, 0x01, 0x02)),
         )
+        assertEquals(P.ModeState(P.MODE_CW, false, null), P.parseMode(bytes(P.MODE_CW)))
         assertEquals(P.ModeState(P.MODE_CW, false, 3), P.parseMode(bytes(P.MODE_CW, 3)))
+        assertNull(P.parseMode(bytes()))
+        assertNull(P.parseMode(bytes(P.MODE_USB, 1, 2)))
         assertNull(P.parseModeData(bytes(0x00, P.MODE_USB, 0x02, 0x02)))
         assertNull(P.parseModeData(bytes(0x01, P.MODE_USB, 0x01, 0x02)))
         assertNull(P.parseMode(bytes(P.MODE_USB, 0)))

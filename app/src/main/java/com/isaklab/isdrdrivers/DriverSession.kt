@@ -61,7 +61,9 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
 import java.nio.BufferUnderflowException
+import java.net.InetAddress
 import java.net.Socket
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CompletableDeferred
@@ -133,6 +135,67 @@ internal fun encodeRtlInfo(info: RtlTunerInfo): ByteBuffer {
         putInt(gains.size)
         gains.forEach { putInt(it) }
         flip()
+    }
+}
+
+/**
+ * Stable identity of the physical endpoint a CMD_OPEN will actually use.
+ * Defaults and documented aliases must collapse to one key, otherwise two
+ * sessions can bypass the single-owner guard while driving the same radio.
+ */
+internal fun normalizedDeviceKey(
+    kind: Int,
+    host: String,
+    port: Int,
+    flags: Int,
+    verifiedHost: String? = null,
+): String {
+    fun normalizedHost(value: String): String =
+        value.trim().removeSuffix(".").lowercase(Locale.ROOT)
+    fun resolvedHost(value: String): String {
+        val normalized = normalizedHost(value)
+        if (normalized.isEmpty()) return normalized
+        return runCatching { InetAddress.getByName(normalized).hostAddress }
+            .getOrNull()
+            ?.let(::normalizedHost)
+            ?: normalized
+    }
+
+    return when (kind) {
+        DriverProto.DEV_RTL_USB -> "$kind/usb"
+        DriverProto.DEV_HACKRF -> "$kind/usb"
+        DriverProto.DEV_ICOM_IQ -> "$kind/usb"
+        DriverProto.DEV_RTL_TCP -> "$kind/${resolvedHost(host)}:$port"
+        DriverProto.DEV_HPSDR_P1 -> {
+            val target = resolvedHost(
+                verifiedHost ?: host.ifEmpty { Hl2Client.BROADCAST },
+            )
+            val targetPort = if (port > 0) port else Hl2Protocol.PORT
+            "$kind/$target:$targetPort"
+        }
+        // G2 discovery currently occurs inside connect() and CMD_OPEN's port
+        // is ignored. Until its verified IP is exposed, one conservative key
+        // prevents broadcast and explicit aliases from driving one board.
+        DriverProto.DEV_G2 -> "$kind/protocol2"
+        DriverProto.DEV_CAT -> {
+            val dialect = DriverProto.catDialect(flags)
+            val target = if (dialect == DriverProto.CAT_DIALECT_KENWOOD) {
+                val at = host.lastIndexOf('@')
+                if (at >= 0) host.substring(at + 1) else host
+            } else {
+                host
+            }
+            if (target.isEmpty() || target == "usb") {
+                // Baud does not identify the USB adapter. Empty and "usb"
+                // both open the same first compatible CDC device.
+                "$kind/usb"
+            } else {
+                val defaultPort = if (dialect == DriverProto.CAT_DIALECT_KENWOOD) 60000 else 4532
+                val targetPort = if (port > 0) port else defaultPort
+                "$kind/${resolvedHost(target)}:$targetPort"
+            }
+        }
+        else -> "$kind/${normalizedHost(host)}:$port"
     }
 }
 
@@ -338,7 +401,14 @@ class DriverSession(
      * dropped-and-counted on consumer lag). False = not armed or block too
      * big for a slot — caller falls back to the TCP frame path.
      */
-    private fun publishShm(type: Int, a: Int, fft: FloatArray, iq: FloatArray, tag: Int): Boolean {
+    private fun publishShm(
+        type: Int,
+        a: Int,
+        fft: FloatArray,
+        iq: FloatArray,
+        tag: Int,
+        epoch: OpenEpochGate.Epoch,
+    ): Boolean {
         if (!shmArmed) return false
         val seq = synchronized(shmLock) {
             val ring = shmRing ?: return false
@@ -351,8 +421,22 @@ class DriverSession(
         }
         val b = obtainBuf(8)
         java.nio.ByteBuffer.wrap(b).putLong(seq)
-        enqueue(OutEntry(DriverProto.EV_SHM_FRAME, b, 8, null, droppable = true))
+        enqueue(
+            OutEntry(
+                DriverProto.EV_SHM_FRAME,
+                b,
+                8,
+                null,
+                droppable = true,
+                epoch = epoch,
+            ),
+        )
         return true
+    }
+
+    /** Discard shared-memory frames belonging to a revoked radio generation. */
+    private fun discardShmBacklog() {
+        synchronized(shmLock) { shmRing?.resetForAttach() }
     }
 
     private var rtlTcp: RTLTCPClient? = null
@@ -372,13 +456,16 @@ class DriverSession(
     private val repeaterTerminalLock = Object()
     private var repeaterTerminalTail: CompletableDeferred<Unit>? = null
 
-    /**
-     * Client generation, bumped on every open/close. Driver callbacks carry
-     * the generation they were created for and are ignored once stale — so a
-     * replaced client's asynchronous "Disconnected" can never overwrite the
-     * new client's "Connected" (the disconnect path is async in every client).
-     */
-    private val clientGen = java.util.concurrent.atomic.AtomicInteger()
+    /** One universal publication gate for every asynchronous driver callback. */
+    private val openEpochs = OpenEpochGate()
+    /** Serialises local status effects after the epoch decision is made. */
+    private val statusDeliveryLock = Any()
+    /** Hold synchronous/callback readbacks until their command terminal enters FIFO. */
+    private val commandReplyLock = Any()
+    private var commandReplyEpoch: OpenEpochGate.Epoch? = null
+    private var commandReplies: MutableList<OutEntry>? = null
+    /** Protects only session pointers; hardware calls always happen outside it. */
+    private val radioLock = Any()
 
     fun start() {
         thread(name = "driver-session") { readLoop() }
@@ -413,6 +500,7 @@ class DriverSession(
         val len: Int,
         val run: (() -> Unit)?,
         val droppable: Boolean,
+        val epoch: OpenEpochGate.Epoch? = null,
     )
 
     private val outLock = Object()
@@ -465,9 +553,20 @@ class DriverSession(
                     if (outQueue.isEmpty()) return   // closed and drained
                     outQueue.removeFirst()
                 }
-                if (e.run != null) e.run.invoke()
-                else frames.writeRaw(e.op, e.buf!!, e.len)
-                e.buf?.let(::recycleBuf)
+                // Revalidate at the sole physical writer, not merely when a
+                // callback enqueues. If revocation wins, the stale payload is
+                // recycled. If this check wins, FIFO guarantees this frame
+                // completes before every later close/new-OPEN terminal.
+                if (e.epoch != null && !openEpochs.isPublished(e.epoch)) {
+                    e.buf?.let(::recycleBuf)
+                    continue
+                }
+                try {
+                    if (e.run != null) e.run.invoke()
+                    else frames.writeRaw(e.op, e.buf!!, e.len)
+                } finally {
+                    e.buf?.let(::recycleBuf)
+                }
             }
         } catch (ex: Exception) {
             if (!closed) Log.i(TAG, "outbound writer ended: ${ex.message}")
@@ -489,9 +588,18 @@ class DriverSession(
     }
 
     fun close() {
-        if (closed) return
+        val shutdown = openEpochs.shutdown()
+        if (!shutdown.first) return
         closed = true
-        closeDevice()
+        (currentRadio() as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
+        openEpochs.awaitQuiescent(shutdown.second)
+        discardShmBacklog()
+        val detached = detachRadio()
+        disconnectRadio(detached)
+        openEpochs.awaitAttempts(shutdown.second)
+        // A connect() that allocated resources after the first cancellation
+        // request must still reach an idempotent terminal teardown before EOF.
+        disconnectRadio(detached)
         releaseShm()
         synchronized(outLock) { outLock.notifyAll() }   // release the writer
         scope.cancel()
@@ -555,47 +663,57 @@ class DriverSession(
         scope.launch {
             while (!closed) {
                 kotlinx.coroutines.delay(250)
-                val last = lastTxIqMs
-                val now = android.os.SystemClock.elapsedRealtime()
-                if (!com.isaklab.isdrdrivers.core.TxWatchdogPolicy
-                        .shouldUnkeyFor(
-                            pttOn,
-                            keyedAtMs,
-                            last,
-                            now,
-                            streamsTxIq = radio !is CatControlCapable,
-                        )
-                ) {
-                    continue
-                }
-                Log.w(
-                    TAG,
-                    "transmit watchdog: keyed ${now - keyedAtMs} ms, last IQ " +
-                        "${if (last == 0L) "never" else "${now - last} ms ago"} — unkeying",
-                )
-                pttOn = false
-                lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
-                try {
-                    // Through the capability, not per-radio fields: every
-                    // transmit-capable radio — current and future — gets the
-                    // same watchdog unkey, or a new driver would ship with a
-                    // silent hole in the safety net.
-                    (radio as? TransmitCapable)?.setPtt(false)
-                } catch (e: Exception) {
-                    Log.e(TAG, "watchdog could not unkey: ${e.message}")
-                }
-                runCatching { sendTxState() }
+                runTxWatchdogTick(android.os.SystemClock.elapsedRealtime())
             }
+        }
+    }
+
+    /** One generation-bound watchdog decision, split out for race tests. */
+    private fun runTxWatchdogTick(now: Long): Boolean {
+        val epoch = openEpochs.publishedEpoch() ?: return false
+        val lease = openEpochs.acquirePublished(epoch) ?: return false
+        try {
+            val current = currentRadio() ?: return false
+            val last = lastTxIqMs
+            if (!com.isaklab.isdrdrivers.core.TxWatchdogPolicy
+                    .shouldUnkeyFor(
+                        pttOn,
+                        keyedAtMs,
+                        last,
+                        now,
+                        streamsTxIq = current !is CatControlCapable,
+                    )
+            ) {
+                return false
+            }
+            Log.w(
+                TAG,
+                "transmit watchdog: keyed ${now - keyedAtMs} ms, last IQ " +
+                    "${if (last == 0L) "never" else "${now - last} ms ago"} — unkeying",
+            )
+            pttOn = false
+            lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
+            try {
+                // The epoch lease prevents handover from installing B while
+                // an expiry decision captured for A is still unkeying A.
+                (current as? TransmitCapable)?.setPtt(false)
+            } catch (e: Exception) {
+                Log.e(TAG, "watchdog could not unkey: ${e.message}")
+            }
+            enqueueTxState(epoch, current)
+            return true
+        } finally {
+            openEpochs.release(lease)
         }
     }
 
     /** Last spectrum actually put on the wire; see [onData]. */
     private var lastSentSpectrum: FloatArray? = null
 
-    private fun onData(fft: FloatArray, iq: FloatArray) {
+    private fun onData(epoch: OpenEpochGate.Epoch, fft: FloatArray, iq: FloatArray) {
         val tag = flushSeq
         flushSeq = (flushSeq + 1) and 0x7fffffff
-        if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq, tag)) return
+        if (publishShm(DriverProto.EV_DATA, fft.size, fft, iq, tag, epoch)) return
         // Ship the spectrum only when it is NEW.
         //
         // Every driver recomputes the FFT on a DISPLAY cadence (~12 fps) but
@@ -626,12 +744,21 @@ class DriverSession(
         bb.putInt(iq.size)
         bb.position(IqCodec.encode(iq, iq.size, fmt, b, bb.position()))
         bb.putInt(tag)
-        enqueue(OutEntry(DriverProto.EV_DATA, b, len, null, droppable = true))
+        enqueue(
+            OutEntry(
+                DriverProto.EV_DATA,
+                b,
+                len,
+                null,
+                droppable = true,
+                epoch = epoch,
+            ),
+        )
     }
 
-    private fun onDataRx(rx: Int, iq: FloatArray) {
+    private fun onDataRx(epoch: OpenEpochGate.Epoch, rx: Int, iq: FloatArray) {
         val tag = flushSeq                       // seq of the flush's EV_DATA
-        if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq, tag)) return
+        if (publishShm(DriverProto.EV_DATA_RX, rx, EMPTY_FLOATS, iq, tag, epoch)) return
         val fmt = DriverProto.IQ_WIRE_FORMAT
         val len = 12 + IqCodec.encodedSize(fmt, iq.size)
         val b = obtainBuf(len)
@@ -640,35 +767,126 @@ class DriverSession(
         bb.putInt(iq.size)
         bb.position(IqCodec.encode(iq, iq.size, fmt, b, bb.position()))
         bb.putInt(tag)
-        enqueue(OutEntry(DriverProto.EV_DATA_RX, b, len, null, droppable = true))
+        enqueue(
+            OutEntry(
+                DriverProto.EV_DATA_RX,
+                b,
+                len,
+                null,
+                droppable = true,
+                epoch = epoch,
+            ),
+        )
     }
 
-    private fun onSweepBlock(lowerEdgeHz: Long, iq: FloatArray) {
+    private fun onSweepBlock(
+        epoch: OpenEpochGate.Epoch,
+        lowerEdgeHz: Long,
+        iq: FloatArray,
+    ) {
         val len = 12 + iq.size * 4
         val b = obtainBuf(len)
         val bb = java.nio.ByteBuffer.wrap(b)
         bb.putLong(lowerEdgeHz)
         bb.putInt(iq.size)
         bb.asFloatBuffer().put(iq)
-        enqueue(OutEntry(DriverProto.EV_SWEEP_BLOCK, b, len, null, droppable = true))
+        enqueue(
+            OutEntry(
+                DriverProto.EV_SWEEP_BLOCK,
+                b,
+                len,
+                null,
+                droppable = true,
+                epoch = epoch,
+            ),
+        )
     }
 
-    private fun onStatus(connected: Boolean, status: String) {
+    private fun onStatus(
+        epoch: OpenEpochGate.Epoch,
+        connected: Boolean,
+        status: String,
+    ) {
         DriverServiceState.update {
             it.copy(radioStatus = status, radioConnected = connected)
         }
         // Through the queue (never dropped) so status stays ordered with the
         // data frames around it.
-        enqueue(OutEntry(0, null, 0, { frames.writeStatus(connected, status) }, droppable = false))
+        enqueue(
+            OutEntry(
+                0,
+                null,
+                0,
+                { frames.writeStatus(connected, status) },
+                droppable = false,
+                // A link-down status is the terminal that revoked this epoch;
+                // it must survive that revocation. Positive/status-progress
+                // callbacks remain generation-tagged.
+                epoch = epoch.takeIf { connected },
+            ),
+        )
     }
 
-    /** [onStatus] gated on the client generation it was created for. */
-    private fun statusFor(gen: Int): (Boolean, String) -> Unit = { connected, status ->
-        if (gen == clientGen.get()) {
-            radioControlReady = connected
-            onStatus(connected, status)
+    /** Hold pre-open status and reject every stale generation after hand-over. */
+    private fun statusFor(epoch: OpenEpochGate.Epoch): (Boolean, String) -> Unit =
+        { connected, status ->
+            val lease = openEpochs.status(epoch, connected, status)
+            if (lease != null) deliverStatusLease(epoch, connected, status, lease)
+        }
+
+    /**
+     * Apply status effects in epoch order without holding the lifecycle gate.
+     * A terminal false revokes the epoch before reaching this method. If an
+     * older true callback had already acquired a lease but resumes after that
+     * false, the recheck under this delivery lock prevents it from restoring
+     * a locally connected/command-ready state.
+     */
+    private fun deliverStatusLease(
+        epoch: OpenEpochGate.Epoch,
+        connected: Boolean,
+        status: String,
+        lease: OpenEpochGate.Lease,
+    ) {
+        try {
+            synchronized(statusDeliveryLock) {
+                if (connected && !openEpochs.isPublished(epoch)) return@synchronized
+                if (!connected) discardShmBacklog()
+                radioControlReady = connected
+                onStatus(epoch, connected, status)
+            }
+        } finally {
+            openEpochs.release(lease)
         }
     }
+
+    private fun deliverPublished(epoch: OpenEpochGate.Epoch, block: () -> Unit) {
+        val lease = openEpochs.acquirePublished(epoch) ?: return
+        try {
+            block()
+        } finally {
+            openEpochs.release(lease)
+        }
+    }
+
+    private fun dataFor(epoch: OpenEpochGate.Epoch): (FloatArray, FloatArray) -> Unit =
+        { fft, iq -> deliverPublished(epoch) { onData(epoch, fft, iq) } }
+
+    private fun dataRxFor(epoch: OpenEpochGate.Epoch): (Int, FloatArray) -> Unit =
+        { rx, iq -> deliverPublished(epoch) { onDataRx(epoch, rx, iq) } }
+
+    private fun sweepFor(epoch: OpenEpochGate.Epoch): (Long, FloatArray) -> Unit =
+        { lowerEdgeHz, iq ->
+            deliverPublished(epoch) { onSweepBlock(epoch, lowerEdgeHz, iq) }
+        }
+
+    private fun hl2TelemetryFor(epoch: OpenEpochGate.Epoch): (Hl2Protocol.Telemetry) -> Unit =
+        { telemetry -> deliverPublished(epoch) { onHl2Telemetry(epoch, telemetry) } }
+
+    private fun g2StatusFor(epoch: OpenEpochGate.Epoch): (G2Protocol.Status) -> Unit =
+        { status -> deliverPublished(epoch) { onG2Status(epoch, status) } }
+
+    private fun hackRfGapsFor(epoch: OpenEpochGate.Epoch): (Long) -> Unit =
+        { gaps -> deliverPublished(epoch) { onHackRfGaps(epoch, gaps) } }
 
     /**
      * The panadapter window actually in force. Through the queue, never
@@ -680,11 +898,22 @@ class DriverSession(
         b.putInt(decimation)
         b.putLong(offsetHz)
         b.flip()
-        enqueue(OutEntry(0, null, 0, { frames.write(DriverProto.EV_SPECTRUM_ZOOM, b) }, droppable = false))
+        enqueueReadback(openEpochs.publishedEpoch()) {
+            frames.write(DriverProto.EV_SPECTRUM_ZOOM, b)
+        }
     }
 
-    private fun sendTelemetry(t: RadioTelemetry) =
-        enqueue(OutEntry(0, null, 0, { frames.writeTelemetry(t) }, droppable = true))
+    private fun sendTelemetry(epoch: OpenEpochGate.Epoch, t: RadioTelemetry) =
+        enqueue(
+            OutEntry(
+                0,
+                null,
+                0,
+                { frames.writeTelemetry(t) },
+                droppable = true,
+                epoch = epoch,
+            ),
+        )
 
     // ---- HackRF queries -----------------------------------------------------
     //
@@ -708,10 +937,12 @@ class DriverSession(
      */
     private fun sendHackRfInfo() {
         val hrf = hackRf ?: return
-        scope.launch { sendHackRfInfoBlocking(hrf) }
+        val epoch = openEpochs.publishedEpoch() ?: return
+        scope.launch { sendHackRfInfoBlocking(hrf, epoch) }
     }
 
-    private fun sendHackRfInfoBlocking(hrf: HackRfClient) {
+    private fun sendHackRfInfoBlocking(hrf: HackRfClient, epoch: OpenEpochGate.Epoch) {
+        if (!openEpochs.isPublished(epoch)) return
         val info = hrf.boardInfo()
         val clkinResult = hrf.tryClkinStatus()
         val boardsResult = hrf.tryOperacakeBoards()
@@ -761,10 +992,11 @@ class DriverSession(
         bb.putInt(hrf.supportedControls())
         bb.putInt(queryFailedMask)
         bb.flip()
-        send { frames.write(DriverProto.EV_HRF_INFO, bb) }
+        enqueueReadback(epoch) { frames.write(DriverProto.EV_HRF_INFO, bb) }
     }
 
     private fun sendHackRfM0State() {
+        val epoch = openEpochs.publishedEpoch() ?: return
         val st = hackRf?.m0State() ?: return
         val bb = ByteBuffer.allocate(11 * 4)
         bb.putInt(st.requestedMode)
@@ -779,7 +1011,7 @@ class DriverSession(
         bb.putInt(st.nextMode)
         bb.putInt(st.error)
         bb.flip()
-        send { frames.write(DriverProto.EV_HRF_M0_STATE, bb) }
+        enqueueReadback(epoch) { frames.write(DriverProto.EV_HRF_M0_STATE, bb) }
     }
 
     /**
@@ -789,7 +1021,9 @@ class DriverSession(
      */
     private fun sendHackRfSelfTest() {
         val hrf = hackRf ?: return
+        val epoch = openEpochs.publishedEpoch() ?: return
         scope.launch {
+            if (!openEpochs.isPublished(epoch)) return@launch
             val test = hrf.readSelfTest()
             val rtc = hrf.testRtcOsc()
             val msg = test?.message ?: ""
@@ -799,11 +1033,15 @@ class DriverSession(
             bb.put(if (rtc != null) 1 else 0)
             bb.put(if (rtc == true) 1 else 0)
             bb.flip()
-            send { frames.write(DriverProto.EV_HRF_SELFTEST, bb) }
+            enqueueReadback(epoch) { frames.write(DriverProto.EV_HRF_SELFTEST, bb) }
         }
     }
 
-    private fun onHl2Telemetry(t: Hl2Protocol.Telemetry) = sendTelemetry(
+    private fun onHl2Telemetry(
+        epoch: OpenEpochGate.Epoch,
+        t: Hl2Protocol.Telemetry,
+    ) = sendTelemetry(
+        epoch,
         RadioTelemetry(
             temperatureC = t.temperatureC, paCurrentA = t.paCurrentA,
             forwardPower = t.forwardPower.toDouble(),
@@ -821,7 +1059,11 @@ class DriverSession(
         )
     )
 
-    private fun onG2Status(st: G2Protocol.Status) = sendTelemetry(
+    private fun onG2Status(
+        epoch: OpenEpochGate.Epoch,
+        st: G2Protocol.Status,
+    ) = sendTelemetry(
+        epoch,
         RadioTelemetry(
             forwardPower = st.forwardPower.toDouble(),
             reversePower = st.reversePower.toDouble(),
@@ -841,7 +1083,8 @@ class DriverSession(
     // The HackRF has no periodic status packet like the HL2/G2, so its gap
     // count arrives from the client's RX processing thread, only when it
     // changes — same telemetry field, same meaning: samples the stream lost.
-    private fun onHackRfGaps(gaps: Long) = sendTelemetry(
+    private fun onHackRfGaps(epoch: OpenEpochGate.Epoch, gaps: Long) = sendTelemetry(
+        epoch,
         RadioTelemetry(
             rxGaps = gaps, linkDrops = outDrops,
             hasRxGaps = true, hasLinkDrops = true,
@@ -859,9 +1102,18 @@ class DriverSession(
     // )
 
     private fun sendTxState() {
-        val tx = hl2?.isTransmitting() ?: g2?.isTransmitting() ?: hackRf?.isTransmitting()
-            ?: cat?.isTransmitting() ?: kenwoodCat?.isTransmitting() ?: false
-        send { frames.writeBool(DriverProto.EV_TX_STATE, tx) }
+        val epoch = openEpochs.publishedEpoch() ?: return
+        val lease = openEpochs.acquirePublished(epoch) ?: return
+        try {
+            currentRadio()?.let { enqueueTxState(epoch, it) }
+        } finally {
+            openEpochs.release(lease)
+        }
+    }
+
+    private fun enqueueTxState(epoch: OpenEpochGate.Epoch, current: RadioClient) {
+        val tx = (current as? TransmitCapable)?.isTransmitting() ?: false
+        enqueueReadback(epoch) { frames.writeBool(DriverProto.EV_TX_STATE, tx) }
     }
 
     /** Commands whose completion is the V2 EV_COMMAND_RESULT contract. */
@@ -1106,8 +1358,24 @@ class DriverSession(
         return null
     }
 
+    private fun enqueueReadback(epoch: OpenEpochGate.Epoch?, write: () -> Unit) {
+        synchronized(commandReplyLock) {
+            val entry = OutEntry(0, null, 0, write, droppable = false, epoch = epoch)
+            val held = commandReplies
+            if (held != null && commandReplyEpoch === epoch) held.add(entry)
+            else enqueue(entry)
+        }
+    }
+
     private fun sendCommandResult(op: Int, disposition: Int, detail: String = "") {
-        send { frames.writeCommandResult(op, disposition, detail) }
+        synchronized(commandReplyLock) {
+            enqueue(OutEntry(0, null, 0, {
+                frames.writeCommandResult(op, disposition, detail)
+            }, droppable = false, epoch = commandReplyEpoch))
+            commandReplies?.forEach(::enqueue)
+            commandReplies = null
+            commandReplyEpoch = null
+        }
     }
 
     /**
@@ -1117,6 +1385,7 @@ class DriverSession(
      * reserves a terminal slot before any asynchronous work can complete.
      */
     private fun handleCatRepeater(frame: Frame) {
+        val epoch = openEpochs.publishedEpoch()
         val payload = ByteArray(frame.payload.remaining())
         frame.payload.duplicate().get(payload)
         val malformed = controlPayloadError(
@@ -1143,9 +1412,11 @@ class DriverSession(
         }
 
         scope.launch {
+            val lease = epoch?.let(openEpochs::acquirePublished)
             val (disposition, detail) = when {
                 malformed != null -> DriverProto.COMMAND_MALFORMED to malformed
                 unsupported != null -> unsupported
+                lease == null -> DriverProto.COMMAND_NO_RADIO to "radio session was closed"
                 !admitted -> DriverProto.COMMAND_REJECTED to
                     "another CAT repeater transaction is active"
                 else -> {
@@ -1163,8 +1434,11 @@ class DriverSession(
             }
             try {
                 predecessor?.await()
-                sendCommandResult(DriverProto.CMD_CAT_SET_REPEATER, disposition, detail)
+                enqueue(OutEntry(0, null, 0, {
+                    frames.writeCommandResult(DriverProto.CMD_CAT_SET_REPEATER, disposition, detail)
+                }, droppable = false, epoch = epoch))
             } finally {
+                lease?.let(openEpochs::release)
                 if (admitted) repeaterCommandInFlight.set(false)
                 terminal.complete(Unit)
                 synchronized(repeaterTerminalLock) {
@@ -1201,6 +1475,10 @@ class DriverSession(
                 sendCommandResult(frame.op, disposition, detail)
                 return
             }
+            synchronized(commandReplyLock) {
+                commandReplyEpoch = openEpochs.publishedEpoch()
+                commandReplies = mutableListOf()
+            }
         }
         try {
         when (frame.op) {
@@ -1218,7 +1496,7 @@ class DriverSession(
                     DriverProto.FEAT_COMMAND_RESULTS or
                     DriverProto.FEAT_RTL_GAIN_TABLE or
                     DriverProto.FEAT_CAT_REPEATER or
-                    DriverProto.FEAT_CAT_EXACT_PROFILE or
+                    DriverProto.FEAT_CAT_PROFILE_GUARD or
                     // ashmem SharedMemory needs API 27; older devices simply
                     // never advertise the ring and stay on TCP frames.
                     (if (android.os.Build.VERSION.SDK_INT >= 27) DriverProto.FEAT_SHM_RING else 0)
@@ -1250,7 +1528,33 @@ class DriverSession(
                 val port = p.int
                 val flags = p.int
                 if (p.hasRemaining()) throw IOException("tail on CMD_OPEN")
-                scope.launch { openDevice(kind, host, port, flags) }
+                when (val begun = openEpochs.begin()) {
+                    is OpenEpochGate.Begin.Started ->
+                        scope.launch {
+                            val attempt = openEpochs.acquireAttempt(begun.epoch)
+                                ?: return@launch
+                            try {
+                                openDevice(begun.epoch, kind, host, port, flags)
+                            } finally {
+                                openEpochs.releaseAttempt(attempt)
+                            }
+                        }
+                    is OpenEpochGate.Begin.SessionViolation -> {
+                        Log.w(TAG, "second CMD_OPEN while an OPEN is pending — closing session")
+                        // V2 has no request id on EV_OPEN_RESULT. A second
+                        // in-flight OPEN cannot be answered without falsely
+                        // correlating one result, so EOF is the only honest
+                        // terminal for both requests.
+                        openEpochs.awaitQuiescent(begun.retired)
+                        discardShmBacklog()
+                        val detached = detachRadio()
+                        disconnectRadio(detached)
+                        openEpochs.awaitAttempts(begun.retired)
+                        disconnectRadio(detached)
+                        close()
+                    }
+                    OpenEpochGate.Begin.Closed -> Unit
+                }
             }
             DriverProto.CMD_CLOSE -> {
                 if (p.hasRemaining()) throw IOException("payload on CMD_CLOSE")
@@ -1383,7 +1687,7 @@ class DriverSession(
                 when (val r = radio) {
                     is CatControlCapable -> {
                         val applied = r.setCatControl(DriverProto.CATCTL_RF_POWER, level)
-                        send {
+                        enqueueReadback(openEpochs.publishedEpoch()) {
                             frames.writeCatControlResult(
                                 DriverProto.CATCTL_RF_POWER,
                                 level,
@@ -1577,12 +1881,14 @@ class DriverSession(
                 val stopMHz = p.int
                 val rateHz = p.int
                 val stepHz = p.int
+                val epoch = openEpochs.publishedEpoch()
+                    ?: throw IllegalStateException("HackRF session is not published")
                 if (hackRf?.startSweep(
                         startMHz,
                         stopMHz,
                         rateHz,
                         stepHz,
-                        ::onSweepBlock,
+                        sweepFor(epoch),
                     ) != true
                 ) {
                     throw IllegalStateException("HackRF sweep could not start in the current state")
@@ -1699,7 +2005,9 @@ class DriverSession(
                 val r = radio as CatControlCapable
                 val applied = r.setCatMode(m)
                 val actual = r.currentCatMode()
-                send { frames.writeCatModeResult(m, actual, applied) }
+                enqueueReadback(openEpochs.publishedEpoch()) {
+                    frames.writeCatModeResult(m, actual, applied)
+                }
                 if (!applied) throw IllegalStateException("CAT mode was not confirmed")
             }
 
@@ -1710,7 +2018,9 @@ class DriverSession(
                 val id = p.int
                 val value = p.int
                 val applied = (radio as CatControlCapable).setCatControl(id, value)
-                send { frames.writeCatControlResult(id, value, applied, superseded = false) }
+                enqueueReadback(openEpochs.publishedEpoch()) {
+                    frames.writeCatControlResult(id, value, applied, superseded = false)
+                }
                 if (!applied) throw IllegalStateException("CAT control was not confirmed")
             }
 
@@ -1744,39 +2054,42 @@ class DriverSession(
         }
     }
 
-    private suspend fun openDevice(kind: Int, host: String, port: Int, flags: Int) {
-        // Validate identity before close/claim/client allocation. In
-        // particular flags=1 is the retired "some classic ANAN" alias and may
-        // not disturb an existing session or emit control bytes to hardware.
+    private suspend fun openDevice(
+        epoch: OpenEpochGate.Epoch,
+        kind: Int,
+        host: String,
+        port: Int,
+        flags: Int,
+    ) {
+        // Validate identity before claim/client allocation. In particular,
+        // flags=1 is the retired "some classic ANAN" alias and must not emit
+        // control bytes to hardware selected by an ambiguous profile.
         val protocol1Profile = if (kind == DriverProto.DEV_HPSDR_P1) {
             Protocol1Profile.fromOpenFlags(flags)
         } else {
             null
         }
         if (kind == DriverProto.DEV_HPSDR_P1 && protocol1Profile == null) {
-            onStatus(
-                false,
+            failReplacementOpen(
+                epoch,
                 "Ambiguous/unknown Protocol-1 profile flags $flags; choose an exact chassis",
             )
-            send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
             return
         }
         val catProfile = if (kind == DriverProto.DEV_CAT) {
             catOpenFlagsFailure(flags)?.let { detail ->
-                onStatus(false, detail)
-                send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
+                failReplacementOpen(epoch, detail)
                 return
             }
             DriverProto.catProfile(flags)
         } else {
             null
         }
-        // Read-only discovery preflight happens before closeDevice/claimDevice:
-        // a wrong board id or dead selected chassis must not disturb the radio
-        // this session already owns, much less emit start/control frames to the
-        // mismatched address.
+        // Discovery is read-only while the old radio remains live and never
+        // sends start/control frames to a mismatched candidate. CMD_OPEN is a
+        // replacement, however: before either terminal is published below,
+        // the old epoch is revoked, drained and disconnected.
         val verifiedProtocol1Board = if (protocol1Profile != null) {
-            onStatus(false, "Discovering ${protocol1Profile.displayName}…")
             val targetHost = host.ifEmpty { Hl2Client.BROADCAST }
             val targetPort = if (port > 0) port else Hl2Protocol.PORT
             val verified = try {
@@ -1786,50 +2099,59 @@ class DriverSession(
                 null
             }
             if (verified == null) {
-                onStatus(
-                    false,
+                failReplacementOpen(
+                    epoch,
                     "No matching ${protocol1Profile.displayName} board family answered discovery",
                 )
-                send { frames.writeBool(DriverProto.EV_OPEN_RESULT, false) }
                 return
             }
             verified
         } else {
             null
         }
-        closeDevice()
+        if (!handoverOpen(epoch)) return
         // One radio, one session. Reconnection races left a ZOMBIE session
         // holding the same board — both threads fed it, with independent TX
         // sequences, and the zombie kept asserting its (possibly keyed) MOX.
         // The newest claim wins; the old owner is closed before this open
         // touches the hardware.
-        claimDevice("$kind/$host:$port")
-        // New client generation: stale callbacks from the replaced client
-        // (its disconnect is asynchronous) are filtered from here on, so its
-        // late "Disconnected" can never shadow this client's "Connected".
-        val gen = clientGen.incrementAndGet()
-        radioControlReady = false
-        val onStatusGen = statusFor(gen)
-        DriverServiceState.update { it.copy(radio = radioName(kind, flags)) }
+        if (!claimDevice(
+                epoch,
+                normalizedDeviceKey(
+                    kind,
+                    host,
+                    port,
+                    flags,
+                    verifiedProtocol1Board?.address?.hostAddress,
+                ),
+            )
+        ) return
+        val onStatusEpoch = statusFor(epoch)
+        val onDataEpoch = dataFor(epoch)
+        val onDataRxEpoch = dataRxFor(epoch)
+        var failureDetail: String? = null
+
         val ok = try {
             when (kind) {
                 DriverProto.DEV_RTL_TCP -> {
-                    val c = RTLTCPClient(host, port, ::onData, onStatusGen)
-                    rtlTcp = c
-                    radio = c
-                    c.connect()
+                    val c = RTLTCPClient(host, port, onDataEpoch, onStatusEpoch)
+                    installCandidate(epoch, c, radioName(kind, flags)) { rtlTcp = c } &&
+                        connectCandidate(epoch, c)
                 }
                 DriverProto.DEV_RTL_USB -> {
-                    val c = RTLUSBClient(context, ::onData, onStatusGen)
-                    rtlUsb = c
-                    radio = c
-                    c.connect()
+                    val c = RTLUSBClient(context, onDataEpoch, onStatusEpoch)
+                    installCandidate(epoch, c, radioName(kind, flags)) { rtlUsb = c } &&
+                        connectCandidate(epoch, c)
                 }
                 DriverProto.DEV_HACKRF -> {
-                    val c = HackRfClient(context, ::onData, onStatusGen, ::onHackRfGaps)
-                    hackRf = c
-                    radio = c
-                    c.connect()
+                    val c = HackRfClient(
+                        context,
+                        onDataEpoch,
+                        onStatusEpoch,
+                        hackRfGapsFor(epoch),
+                    )
+                    installCandidate(epoch, c, radioName(kind, flags)) { hackRf = c } &&
+                        connectCandidate(epoch, c)
                 }
                 DriverProto.DEV_FLEX -> {
                     // Support withdrawn (libflexk is private and unbundled).
@@ -1838,9 +2160,9 @@ class DriverSession(
                     // FLEX, and an operator who does deserves to be told the
                     // driver dropped it, not left watching a connect that
                     // never completes.
-                    onStatus(false, "FlexRadio support is not available in this build")
+                    onStatusEpoch(false, "FlexRadio support is not available in this build")
                     false
-                    // val c = com.isaklab.libflexk.FlexClient(::onData, onStatusGen, ::onFlexGaps)
+                    // val c = com.isaklab.libflexk.FlexClient(onDataEpoch, onStatusEpoch, ...)
                     // flex = c
                     // val target = host.ifEmpty { c.discover()?.ip ?: "" }
                     // if (target.isEmpty()) {
@@ -1853,35 +2175,35 @@ class DriverSession(
                 }
                 DriverProto.DEV_HPSDR_P1 -> {
                     val profile = checkNotNull(protocol1Profile)
-                    receiverCapacity = profile.receiverCapacity
-                    diversitySupported = profile.diversitySupported
                     val c = Hl2Client(
                         host = host.ifEmpty { Hl2Client.BROADCAST },
-                        onDataReceived = ::onData,
-                        onConnectionStatusChanged = onStatusGen,
-                        onDataRx = ::onDataRx,
-                        onTelemetry = ::onHl2Telemetry,
+                        onDataReceived = onDataEpoch,
+                        onConnectionStatusChanged = onStatusEpoch,
+                        onDataRx = onDataRxEpoch,
+                        onTelemetry = hl2TelemetryFor(epoch),
                         port = if (port > 0) port else Hl2Protocol.PORT,
                         profile = profile,
                         verifiedBoard = checkNotNull(verifiedProtocol1Board),
                     )
-                    hl2 = c
-                    radio = c
-                    c.connect()
+                    installCandidate(epoch, c, radioName(kind, flags)) {
+                        hl2 = c
+                        receiverCapacity = profile.receiverCapacity
+                        diversitySupported = profile.diversitySupported
+                    } && connectCandidate(epoch, c)
                 }
                 DriverProto.DEV_G2 -> {
-                    receiverCapacity = 7
-                    diversitySupported = true
                     val c = G2Client(
                         host = host.ifEmpty { G2Client.BROADCAST },
-                        onDataReceived = ::onData,
-                        onConnectionStatusChanged = onStatusGen,
-                        onStatus = ::onG2Status,
-                        onDataRx = ::onDataRx,
+                        onDataReceived = onDataEpoch,
+                        onConnectionStatusChanged = onStatusEpoch,
+                        onStatus = g2StatusFor(epoch),
+                        onDataRx = onDataRxEpoch,
                     )
-                    g2 = c
-                    radio = c
-                    c.connect()
+                    installCandidate(epoch, c, radioName(kind, flags)) {
+                        g2 = c
+                        receiverCapacity = 7
+                        diversitySupported = true
+                    } && connectCandidate(epoch, c)
                 }
                 DriverProto.DEV_CAT -> when (DriverProto.catDialect(flags)) {
                     DriverProto.CAT_DIALECT_CIV -> {
@@ -1894,7 +2216,7 @@ class DriverSession(
                         val transport = if (host.isEmpty() || host == "usb") {
                             val t = UsbCdcTransport(context, if (port > 0) port else 115200)
                             if (!t.open()) {
-                                onStatus(false, "No USB serial adapter found")
+                                onStatusEpoch(false, "No USB serial adapter found")
                                 null
                             } else {
                                 t
@@ -1906,36 +2228,15 @@ class DriverSession(
                             false
                         } else {
                             val profile = checkNotNull(catProfile)
-                            val exact = profile != DriverProto.CAT_PROFILE_GENERIC
-                            val identityTransport = if (exact) {
-                                ExactCivIdentityTransport(transport, profile)
-                            } else {
-                                null
-                            }
-                            val gate = if (exact) {
-                                ExactCatAdmissionGate(::onData, onStatusGen)
-                            } else {
-                                null
-                            }
                             val c = CivClient(
-                                identityTransport ?: transport,
+                                transport,
                                 flags and DriverProto.CAT_ADDRESS_MASK,
-                                gate?.let { it::onData } ?: ::onData,
-                                gate?.let { it::onStatus } ?: onStatusGen,
+                                onDataEpoch,
+                                onStatusEpoch,
+                                requiredReportedCivAddress(profile),
                             )
-                            cat = c
-                            radio = c
-                            val connected = c.connect()
-                            if (gate == null) {
-                                connected
-                            } else {
-                                val identityFailure = identityTransport?.identityFailure
-                                    ?: catPhysicalIdentityFailure(
-                                        profile,
-                                        identityTransport?.physicalIdentity,
-                                    )
-                                gate.finish(connected, identityFailure, c.modelName())
-                            }
+                            installCandidate(epoch, c, radioName(kind, flags)) { cat = c } &&
+                                connectCandidate(epoch, c)
                         }
                     }
                     DriverProto.CAT_DIALECT_KENWOOD -> {
@@ -1963,7 +2264,7 @@ class DriverSession(
                         val transport = if (serial) {
                             val t = UsbCdcTransport(context, if (port > 0) port else 115200)
                             if (!t.open()) {
-                                onStatus(false, "No USB serial adapter found")
+                                onStatusEpoch(false, "No USB serial adapter found")
                                 null
                             } else {
                                 t
@@ -1975,41 +2276,20 @@ class DriverSession(
                             false
                         } else {
                             val profile = checkNotNull(catProfile)
-                            val exact = profile != DriverProto.CAT_PROFILE_GENERIC
-                            val identityTransport = if (exact) {
-                                ExactKenwoodIdentityTransport(transport, profile)
-                            } else {
-                                null
-                            }
-                            val gate = if (exact) {
-                                ExactCatAdmissionGate(::onData, onStatusGen)
-                            } else {
-                                null
-                            }
                             val c = KenwoodClient(
-                                identityTransport ?: transport,
+                                transport,
                                 if (serial) KenwoodClient.Link.SERIAL else KenwoodClient.Link.LAN,
                                 credentials,
-                                gate?.let { it::onData } ?: ::onData,
-                                gate?.let { it::onStatus } ?: onStatusGen,
+                                onDataEpoch,
+                                onStatusEpoch,
+                                requiredKenwoodModelId(profile),
                             )
-                            kenwoodCat = c
-                            radio = c
-                            val connected = c.connect()
-                            if (gate == null) {
-                                connected
-                            } else {
-                                val identityFailure = identityTransport?.identityFailure
-                                    ?: catPhysicalIdentityFailure(
-                                        profile,
-                                        identityTransport?.physicalIdentity,
-                                    )
-                                gate.finish(connected, identityFailure, c.modelName())
-                            }
+                            installCandidate(epoch, c, radioName(kind, flags)) { kenwoodCat = c } &&
+                                connectCandidate(epoch, c)
                         }
                     }
                     else -> {
-                        onStatus(false, "unknown CAT dialect in the open flags")
+                        onStatusEpoch(false, "unknown CAT dialect in the open flags")
                         false
                     }
                 }
@@ -2020,7 +2300,7 @@ class DriverSession(
                     // falling through to the "unknown device" path, so an
                     // operator who asks for it is told why instead of
                     // watching a connect that never completes.
-                    onStatus(
+                    onStatusEpoch(
                         false,
                         "Icom native IQ (IC-7610/IC-R8600) is served by the desktop host; " +
                             "phone USB is out of scope",
@@ -2031,45 +2311,296 @@ class DriverSession(
             }
         } catch (e: Exception) {
             Log.e(TAG, "open kind=$kind failed: ${e.message}")
+            failureDetail = e.message ?: e.javaClass.simpleName
             false
         }
-        if (!ok) closeDevice()
-        send { frames.writeBool(DriverProto.EV_OPEN_RESULT, ok) }
-        // The state in force the moment the radio opens, BEFORE the app has
-        // set anything: whatever the hardware powered up on or a previous
-        // session left it holding. Announcing both means there is no window
-        // in which the two sides disagree unnoticed.
-        if (ok) {
-            // Queued drivers report back when a rate/frequency command has
-            // actually been applied; announce the truth at that moment too.
-            radio?.setStateListener {
-                announceSampleRate()
-                announceFrequency()
-            }
-            announceSampleRate()
-            announceFrequency()
-            if (rtlTcp != null || rtlUsb != null) sendRtlInfo()
+        val opened = currentRadio()
+        if (!ok || opened == null) {
+            failOpen(epoch, opened, failureDetail)
+            return
         }
+        if (!openEpochs.isConnecting(epoch)) {
+            // CLOSE may have detached and disconnected the candidate between
+            // install() and connect(). Disconnect again after a late connect
+            // result: RadioClient.disconnect is an idempotent contract, and a
+            // revoked candidate must never remain physically active.
+            disconnectRadio(detachRadio(opened) ?: opened)
+            return
+        }
+        enqueueOpenSuccess(epoch, opened, radioName(kind, flags))
+    }
+
+    /**
+     * Install one candidate while holding a short CONNECTING lease. CLOSE
+     * revokes first and then waits for this local pointer/listener operation,
+     * so a cancelled A can never overwrite or detach a successor B.
+     */
+    internal fun installCandidate(
+        epoch: OpenEpochGate.Epoch,
+        client: RadioClient,
+        displayName: String,
+        attachTypedClient: () -> Unit,
+    ): Boolean {
+        val installLease = openEpochs.acquireConnecting(epoch)
+        if (installLease == null) {
+            disconnectRadio(client)
+            return false
+        }
+        var accepted = false
+        var detached: RadioClient? = null
+        try {
+            synchronized(radioLock) {
+                radioControlReady = false
+                radio = client
+                attachTypedClient()
+                DriverServiceState.update { it.copy(radio = displayName) }
+            }
+            client.setStateListener {
+                deliverPublished(epoch) {
+                    announceSampleRate(client, epoch)
+                    announceFrequency(client, epoch)
+                }
+            }
+            accepted = openEpochs.isConnecting(epoch)
+            if (!accepted) detached = detachRadio(client)
+        } finally {
+            openEpochs.release(installLease)
+        }
+        if (!accepted) disconnectRadio(detached ?: client)
+        return accepted
+    }
+
+    /**
+     * A connect implementation may allocate its socket/USB/thread only after
+     * CLOSE's first cancellation request has returned. Always perform a final
+     * idempotent teardown when the attempt returns into a revoked epoch.
+     */
+    internal suspend fun connectCandidate(
+        epoch: OpenEpochGate.Epoch,
+        client: RadioClient,
+    ): Boolean {
+        val connected = client.connect()
+        if (!openEpochs.isConnecting(epoch)) {
+            disconnectRadio(detachRadio(client) ?: client)
+            return false
+        }
+        return connected
+    }
+
+    /** Linearise CMD_OPEN replacement before publishing either terminal. */
+    private fun handoverOpen(epoch: OpenEpochGate.Epoch): Boolean {
+        val previous = currentRadio()
+        val handover = openEpochs.handover(epoch)
+        if (!handover.accepted) return false
+        openEpochs.awaitQuiescent(listOfNotNull(handover.retired))
+        discardShmBacklog()
+        disconnectRadio(previous?.let(::detachRadio))
+        return openEpochs.isConnecting(epoch)
+    }
+
+    /** Fail one replacement only after the prior radio can no longer publish. */
+    private fun failReplacementOpen(epoch: OpenEpochGate.Epoch, detail: String) {
+        if (handoverOpen(epoch)) failOpen(epoch, null, detail)
+    }
+
+    /** Queue the sole positive OPEN terminal; the writer owns publication. */
+    private fun enqueueOpenSuccess(
+        epoch: OpenEpochGate.Epoch,
+        opened: RadioClient,
+        fallbackStatus: String,
+    ) {
+        enqueue(
+            OutEntry(
+                0,
+                null,
+                0,
+                {
+                    when (val start = openEpochs.startCommit(epoch)) {
+                        is OpenEpochGate.CommitStart.Rejected -> {
+                            val detached = detachRadio(opened)
+                            DriverServiceState.update {
+                                it.copy(radioStatus = start.detail, radioConnected = false)
+                            }
+                            openEpochs.completeTerminal(start.lease)
+                            frames.writeStatus(false, start.detail)
+                            frames.writeBool(DriverProto.EV_OPEN_RESULT, false)
+                            disconnectRadio(detached)
+                        }
+                        OpenEpochGate.CommitStart.Ready -> {
+                            // No lifecycle monitor is held across socket I/O.
+                            // COMMITTING nevertheless gives this FIFO terminal
+                            // precedence over a concurrent CMD_CLOSE.
+                            frames.writeBool(DriverProto.EV_OPEN_RESULT, true)
+                            val finish = openEpochs.finishCommit(epoch)
+                            when (finish) {
+                                is OpenEpochGate.CommitFinish.Published -> {
+                                    val status = finish.status
+                                        ?: OpenEpochGate.Status(true, fallbackStatus)
+                                    val initial = try {
+                                        synchronized(statusDeliveryLock) {
+                                            if (!openEpochs.isPublished(epoch)) {
+                                                null
+                                            } else {
+                                                radioControlReady = true
+                                                DriverServiceState.update {
+                                                    it.copy(
+                                                        radioStatus = status.detail,
+                                                        radioConnected = true,
+                                                    )
+                                                }
+                                                // Capture only after
+                                                // publication. State callbacks
+                                                // after this point enqueue
+                                                // behind the current FIFO item.
+                                                captureInitialState(opened)
+                                            }
+                                        }
+                                    } finally {
+                                        // CLOSE may now detach/reset state,
+                                        // but it cannot have completed before
+                                        // all local publication effects above.
+                                        openEpochs.release(finish.lease)
+                                    }
+                                    if (initial != null) {
+                                        frames.writeStatus(true, status.detail)
+                                        writeInitialState(initial)
+                                    }
+                                }
+                                is OpenEpochGate.CommitFinish.Rejected -> {
+                                    val detached = detachRadio(opened)
+                                    DriverServiceState.update {
+                                        it.copy(
+                                            radioStatus = finish.detail,
+                                            radioConnected = false,
+                                        )
+                                    }
+                                    openEpochs.completeTerminal(finish.lease)
+                                    frames.writeStatus(false, finish.detail)
+                                    disconnectRadio(detached)
+                                }
+                                OpenEpochGate.CommitFinish.Revoked -> Unit
+                            }
+                        }
+                        OpenEpochGate.CommitStart.Stale -> Unit
+                    }
+                },
+                droppable = false,
+            ),
+        )
+    }
+
+    /** Resolve one candidate failure with one status and one negative result. */
+    private fun failOpen(
+        epoch: OpenEpochGate.Epoch,
+        candidate: RadioClient?,
+        detail: String?,
+    ) {
+        val failure = openEpochs.fail(epoch, detail, "Radio did not connect") ?: return
+        val resolved = failure.detail
+        val detached: RadioClient?
+        try {
+            detached = if (candidate != null) {
+                detachRadio(candidate)
+            } else {
+                // Some refusals happen after this epoch won the board claim
+                // but before a RadioClient exists. Release only this epoch's
+                // claim; a read-only preflight has no candidate to teardown.
+                releaseDeviceClaim(epoch)
+                null
+            }
+            DriverServiceState.update {
+                it.copy(radioStatus = resolved, radioConnected = false)
+            }
+            enqueue(
+                OutEntry(
+                    0,
+                    null,
+                    0,
+                    {
+                        if (openEpochs.isRunning()) {
+                            frames.writeStatus(false, resolved)
+                            frames.writeBool(DriverProto.EV_OPEN_RESULT, false)
+                        }
+                    },
+                    droppable = false,
+                ),
+            )
+        } finally {
+            openEpochs.completeTerminal(failure.lease)
+        }
+        disconnectRadio(detached)
+    }
+
+    /** Initial hardware truth, emitted synchronously by the OPEN FIFO item. */
+    private data class InitialOpenState(
+        val sampleRate: Int,
+        val frequency: Long,
+        val rtlInfo: ByteBuffer?,
+    )
+
+    private fun captureInitialState(opened: RadioClient): InitialOpenState = InitialOpenState(
+        opened.sampleRateHz(),
+        opened.frequencyHz(),
+        if (opened is RTLTCPClient || opened is RTLUSBClient) {
+            encodeRtlInfo(rtlInfo(opened))
+        } else {
+            null
+        },
+    )
+
+    private fun writeInitialState(initial: InitialOpenState) {
+        if (initial.sampleRate > 0) {
+            frames.writeI32(DriverProto.EV_SAMPLE_RATE, initial.sampleRate)
+        }
+        if (initial.frequency > 0) {
+            frames.writeI64(DriverProto.EV_FREQUENCY, initial.frequency)
+        }
+        initial.rtlInfo?.let { frames.write(DriverProto.EV_RTL_INFO, it) }
     }
 
     /** Exact tuner/gain metadata; an unknown table is encoded as known=0,n=0. */
     private fun sendRtlInfo() {
-        val info = rtlTcp?.tunerInfo() ?: rtlUsb?.tunerInfo()
-            ?: throw IllegalStateException("no RTL radio is open")
-        val bb = encodeRtlInfo(info)
-        send { frames.write(DriverProto.EV_RTL_INFO, bb) }
+        val current = radio ?: throw IllegalStateException("no RTL radio is open")
+        val bb = encodeRtlInfo(rtlInfo(current))
+        enqueueReadback(openEpochs.publishedEpoch()) { frames.write(DriverProto.EV_RTL_INFO, bb) }
+    }
+
+    private fun rtlInfo(client: RadioClient): RtlTunerInfo = when (client) {
+        is RTLTCPClient -> client.tunerInfo()
+        is RTLUSBClient -> client.tunerInfo()
+        else -> throw IllegalStateException("no RTL radio is open")
     }
 
     /** EV_FREQUENCY with the frequency in force; zero (cannot say) is never announced. */
     private fun announceFrequency() {
-        val hz = radio?.frequencyHz() ?: return
-        if (hz > 0) send { frames.writeI64(DriverProto.EV_FREQUENCY, hz) }
+        val current = radio ?: return
+        announceFrequency(current)
+    }
+
+    private fun announceFrequency(
+        current: RadioClient,
+        epoch: OpenEpochGate.Epoch? = openEpochs.publishedEpoch(),
+    ) {
+        val hz = current.frequencyHz()
+        if (hz > 0) {
+            enqueueReadback(epoch) { frames.writeI64(DriverProto.EV_FREQUENCY, hz) }
+        }
     }
 
     /** EV_SAMPLE_RATE with the rate in force; zero (cannot say) is never announced. */
     private fun announceSampleRate() {
-        val hz = radio?.sampleRateHz() ?: return
-        if (hz > 0) send { frames.writeI32(DriverProto.EV_SAMPLE_RATE, hz) }
+        val current = radio ?: return
+        announceSampleRate(current)
+    }
+
+    private fun announceSampleRate(
+        current: RadioClient,
+        epoch: OpenEpochGate.Epoch? = openEpochs.publishedEpoch(),
+    ) {
+        val hz = current.sampleRateHz()
+        if (hz > 0) {
+            enqueueReadback(epoch) { frames.writeI32(DriverProto.EV_SAMPLE_RATE, hz) }
+        }
     }
 
     private fun radioName(kind: Int, flags: Int): String = when (kind) {
@@ -2087,35 +2618,64 @@ class DriverSession(
         else -> "?"
     }
 
-    /** Take ownership of a board, closing whichever session held it. */
-    private fun claimDevice(key: String) {
-        currentDeviceKey = key
-        val prev = deviceOwners.put(key, this)
-        if (prev != null && prev !== this) {
-            Log.w(TAG, "device $key claimed by a new session — closing the stale owner")
-            runCatching { prev.close() }
+    /** Take ownership only while this OPEN is still the current candidate. */
+    private fun claimDevice(epoch: OpenEpochGate.Epoch, key: String): Boolean {
+        val claimLease = openEpochs.acquireConnecting(epoch) ?: return false
+        try {
+            var prev: DriverSession? = null
+            synchronized(radioLock) {
+                currentDeviceKey = key
+                currentDeviceEpoch = epoch
+                prev = deviceOwners.put(key, this)
+            }
+            // Once put() won, the previous owner must always be closed. A
+            // cancel concurrent with this short claim waits for the lease, so
+            // CLOSE cannot return and then observe a delayed map/device side
+            // effect from its revoked OPEN coroutine.
+            if (prev != null && prev !== this) {
+                Log.w(TAG, "device $key claimed by a new session — closing the stale owner")
+                runCatching { prev?.close() }
+            }
+            if (!openEpochs.isConnecting(epoch)) {
+                releaseDeviceClaim(epoch)
+                return false
+            }
+            return true
+        } finally {
+            openEpochs.release(claimLease)
+        }
+    }
+
+    private fun releaseDeviceClaim(epoch: OpenEpochGate.Epoch) {
+        synchronized(radioLock) {
+            if (currentDeviceEpoch !== epoch) return
+            currentDeviceKey?.let { deviceOwners.remove(it, this) }
+            currentDeviceKey = null
+            currentDeviceEpoch = null
         }
     }
 
     @Volatile private var currentDeviceKey: String? = null
+    @Volatile private var currentDeviceEpoch: OpenEpochGate.Epoch? = null
 
-    private fun closeDevice() {
+    private fun currentRadio(): RadioClient? = synchronized(radioLock) { radio }
+
+    /**
+     * Detach session pointers only; the caller performs hardware teardown
+     * after the relevant epoch has already been revoked.
+     */
+    private fun detachRadio(): RadioClient? = synchronized(radioLock) {
+        detachCurrentRadioLocked()
+    }
+
+    private fun detachRadio(expected: RadioClient): RadioClient? = synchronized(radioLock) {
+        if (radio !== expected) null else detachCurrentRadioLocked()
+    }
+
+    private fun detachCurrentRadioLocked(): RadioClient? {
+        val current = radio
         currentDeviceKey?.let { deviceOwners.remove(it, this); currentDeviceKey = null }
-        // Invalidate the outgoing clients' callbacks FIRST: their disconnect
-        // paths are asynchronous and must not speak for the next client.
-        clientGen.incrementAndGet()
-        val hadClient = radio != null
-        radio?.setStateListener(null)
-        try {
-            // Never leave the air keyed behind a closing session.
-            (radio as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
-            (radio as? TransmitCapable)?.setPtt(false)
-        } catch (_: Exception) {
-        }
-        try {
-            radio?.disconnect()
-        } catch (_: Exception) {
-        }
+        currentDeviceEpoch = null
         radio = null
         radioControlReady = false
         receiverCount = 1
@@ -2126,6 +2686,9 @@ class DriverSession(
         diversityEnabled = false
         diversityReference = 0
         diversityMemberMask = 0
+        pttOn = false
+        lastTxIqMs = com.isaklab.isdrdrivers.core.TxWatchdogPolicy.NOT_ARMED
+        keyedAtMs = 0L
         txFrequencyReady = true
         rtlTcp = null
         rtlUsb = null
@@ -2137,11 +2700,98 @@ class DriverSession(
         DriverServiceState.update {
             it.copy(radio = null, radioStatus = null, radioConnected = false)
         }
-        // Deterministic close status: the clients' own "Disconnected" events
-        // are generation-filtered out, so emit the terminal status here, in
-        // order, before any successor's "Connected" can be enqueued.
-        if (hadClient && !closed) {
-            enqueue(OutEntry(0, null, 0, { frames.writeStatus(false, "Disconnected") }, droppable = false))
+        return current
+    }
+
+    /** Hardware teardown after the epoch has already been revoked. */
+    private fun disconnectRadio(client: RadioClient?) {
+        if (client == null) return
+        client.setStateListener(null)
+        try {
+            // Never leave the air keyed behind a closing session.
+            (client as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
+            (client as? TransmitCapable)?.setPtt(false)
+        } catch (_: Exception) {
+        }
+        try {
+            client.disconnect()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun closeDevice() {
+        val state = openEpochs.cancel()
+        (currentRadio() as? CatRepeaterCapable)?.requestCatRepeaterCancelForUnkey()
+        openEpochs.awaitQuiescent(state.retired)
+        discardShmBacklog()
+        val detached = detachRadio()
+        // First pass requests cancellation of a connect already inside a
+        // blocking driver. The attempt itself performs a final idempotent
+        // teardown if it returns stale.
+        disconnectRadio(detached)
+        openEpochs.awaitAttempts(state.retired)
+        disconnectRadio(detached)
+        when {
+            state.candidateTerminalInFlight -> Unit
+            state.hadConnecting -> {
+                // False callbacks while CONNECTING also carry progress text
+                // ("Searching…", "Opening…"), so cancellation must not
+                // misreport the last progress line as a physical failure.
+                val detail = "Open cancelled"
+                DriverServiceState.update {
+                    it.copy(radioStatus = detail, radioConnected = false)
+                }
+                enqueue(
+                    OutEntry(
+                        0,
+                        null,
+                        0,
+                        {
+                            if (openEpochs.isRunning()) {
+                                frames.writeStatus(false, detail)
+                                frames.writeBool(DriverProto.EV_OPEN_RESULT, false)
+                            }
+                        },
+                        droppable = false,
+                    ),
+                )
+            }
+            state.hadCommitting -> {
+                val detail = state.candidateStatus
+                    ?.takeUnless { it.connected }
+                    ?.detail
+                    ?: "Disconnected"
+                DriverServiceState.update {
+                    it.copy(radioStatus = detail, radioConnected = false)
+                }
+                enqueue(
+                    OutEntry(
+                        0,
+                        null,
+                        0,
+                        {
+                            if (openEpochs.isRunning()) {
+                                frames.writeStatus(false, detail)
+                            }
+                        },
+                        droppable = false,
+                    ),
+                )
+            }
+            state.publishedTerminalStatus != null -> Unit
+            detached != null -> enqueue(
+                OutEntry(
+                    0,
+                    null,
+                    0,
+                    {
+                        if (openEpochs.isRunning()) {
+                            frames.writeStatus(false, "Disconnected")
+                        }
+                    },
+                    droppable = false,
+                ),
+            )
         }
     }
 }

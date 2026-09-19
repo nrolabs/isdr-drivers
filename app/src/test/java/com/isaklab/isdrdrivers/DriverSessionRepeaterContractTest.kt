@@ -111,6 +111,14 @@ class DriverSessionRepeaterContractTest {
             isAccessible = true
             setBoolean(session, true)
         }
+        val gate = DriverSession::class.java.getDeclaredField("openEpochs").run {
+            isAccessible = true
+            get(session) as OpenEpochGate
+        }
+        val epoch = (gate.begin() as OpenEpochGate.Begin.Started).epoch
+        check(gate.startCommit(epoch) == OpenEpochGate.CommitStart.Ready)
+        val publication = gate.finishCommit(epoch) as OpenEpochGate.CommitFinish.Published
+        gate.release(publication.lease)
         session.start()
         return Harness(
             session,
@@ -148,7 +156,7 @@ class DriverSessionRepeaterContractTest {
             val features = hello.payload.int
             assertEquals(DriverProto.VERSION, version)
             assertTrue(features and DriverProto.FEAT_CAT_REPEATER != 0)
-            assertTrue(features and DriverProto.FEAT_CAT_EXACT_PROFILE != 0)
+            assertTrue(features and DriverProto.FEAT_CAT_PROFILE_GUARD != 0)
         } finally {
             h.session.close()
             h.socket.close()

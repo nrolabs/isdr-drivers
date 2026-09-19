@@ -102,12 +102,14 @@ class KenwoodClientTest {
         rig: FakeRig,
         link: Link,
         credentials: Pair<String, String>?,
+        requiredModelId: Int? = null,
     ): Pair<KenwoodClient, Captured> {
         val cap = Captured()
         val client = KenwoodClient(
             rig, link, credentials,
             { spectrum, iq -> synchronized(cap) { cap.spectra.add(Pair(spectrum.copyOf(), iq.size)) } },
             { up, msg -> synchronized(cap) { cap.status.add(Pair(up, msg)) } },
+            requiredModelId,
         )
         return Pair(client, cap)
     }
@@ -149,6 +151,16 @@ class KenwoodClientTest {
         h.on("OM0;", "OM02;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS44;")
+        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSO;", "BSO0;")
+    }
+
+    private fun scriptSerialTs990(h: FakeRig) {
+        h.on("ID;", "ID023;")
+        h.on("FA;", "FA00007074000;")
+        h.on("OM0;", "OM01;")
+        h.on("BS3;", "BS30;")
+        h.on("BS4;", "BS42;")
         h.on("BSM0;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
     }
@@ -234,6 +246,98 @@ class KenwoodClientTest {
         assertEquals(100_000, c.sampleRateHz())
         assertEquals(listOf(Pair(true, "TS-890S")), synchronized(cap) { ArrayList(cap.status) })
         c.disconnect()
+    }
+
+    @Test
+    fun `required numeric model id match connects before AI and state`() {
+        val h = FakeRig()
+        scriptSerialTs890(h)
+        val (c, cap) = makeClient(
+            h,
+            Link.SERIAL,
+            null,
+            requiredModelId = KenwoodModels.ID_TS890S,
+        )
+
+        assertTrue(connect(c))
+        assertEquals("ID;", h.written().first())
+        assertEquals(listOf(Pair(true, "TS-890S")), synchronized(cap) { ArrayList(cap.status) })
+        assertEquals("TS-890S", c.modelName())
+        c.disconnect()
+    }
+
+    @Test
+    fun `required numeric model id mismatch writes nothing after ID`() {
+        val h = FakeRig()
+        h.on("ID;", "ID023;")
+        val (c, cap) = makeClient(
+            h,
+            Link.SERIAL,
+            null,
+            requiredModelId = KenwoodModels.ID_TS890S,
+        )
+
+        assertFalse(connect(c))
+        assertEquals(listOf("ID;"), h.written())
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertFalse(status[0].first)
+        assertTrue(status[0].second, status[0].second.contains("model ID mismatch"))
+        assertTrue(status[0].second, status[0].second.contains("ID024"))
+        assertTrue(status[0].second, status[0].second.contains("ID023"))
+    }
+
+    @Test
+    fun `required numeric model id rejects malformed reply before AI`() {
+        val h = FakeRig()
+        h.on("ID;", "ID0X4;")
+        val (c, cap) = makeClient(
+            h,
+            Link.SERIAL,
+            null,
+            requiredModelId = KenwoodModels.ID_TS890S,
+        )
+
+        assertFalse(connect(c))
+        assertEquals(listOf("ID;"), h.written())
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertTrue(status[0].second, status[0].second.contains("malformed Kenwood ID"))
+    }
+
+    @Test
+    fun `required numeric model id refuses silence without post ID writes`() {
+        val h = FakeRig()
+        val (c, cap) = makeClient(
+            h,
+            Link.SERIAL,
+            null,
+            requiredModelId = KenwoodModels.ID_TS890S,
+        )
+
+        assertFalse(connect(c))
+        assertEquals(listOf("ID;", "ID;", "ID;"), h.written())
+        val status = synchronized(cap) { ArrayList(cap.status) }
+        assertEquals(1, status.size)
+        assertTrue(status[0].second, status[0].second.contains("did not answer"))
+        assertTrue(status[0].second, status[0].second.contains("ID024"))
+    }
+
+    @Test
+    fun `generic model id mode preserves TS890 and TS990 compatibility`() {
+        val ts890 = FakeRig()
+        scriptSerialTs890(ts890)
+        val (c890, _) = makeClient(ts890, Link.SERIAL, null)
+        assertTrue(connect(c890))
+        assertEquals("TS-890S", c890.modelName())
+        c890.disconnect()
+
+        val ts990 = FakeRig()
+        scriptSerialTs990(ts990)
+        val (c990, _) = makeClient(ts990, Link.SERIAL, null)
+        assertTrue(connect(c990))
+        assertEquals("TS-990S", c990.modelName())
+        c990.disconnect()
     }
 
     @Test

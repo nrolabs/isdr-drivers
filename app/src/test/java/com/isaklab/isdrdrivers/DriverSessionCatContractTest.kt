@@ -187,7 +187,7 @@ class DriverSessionCatContractTest {
     }
 
     @Test
-    fun `cat tx drive emits semantic result before terminal ack`() {
+    fun `cat tx drive emits terminal ack before semantic result`() {
         val listener = ServerSocket(0)
         val client = Socket("127.0.0.1", listener.localPort).apply { soTimeout = 2_000 }
         val server = listener.accept()
@@ -200,14 +200,14 @@ class DriverSessionCatContractTest {
             val wire = wire(client)
             wire.writeI32(DriverProto.CMD_SET_TX_DRIVE, 173)
 
-            assertCatPowerResult(wire, 173, true)
             assertCommandAccepted(wire, DriverProto.CMD_SET_TX_DRIVE)
+            assertCatPowerResult(wire, 173, true)
             assertEquals(listOf(DriverProto.CATCTL_RF_POWER to 173), radio.catControlRequests)
 
             radio.catControlApplied = false
             wire.writeI32(DriverProto.CMD_SET_TX_DRIVE, 91)
-            assertCatPowerResult(wire, 91, false)
             val detail = assertCommandRejected(wire, DriverProto.CMD_SET_TX_DRIVE)
+            assertCatPowerResult(wire, 91, false)
             assertTrue(detail.contains("RF power was not confirmed"))
             assertEquals(
                 listOf(
@@ -245,7 +245,7 @@ class DriverSessionCatContractTest {
     }
 
     @Test
-    fun `rejected cat mode and control emit semantic result then negative ack`() {
+    fun `rejected cat mode and control emit negative ack then semantic result`() {
         val listener = ServerSocket(0)
         val client = Socket("127.0.0.1", listener.localPort).apply { soTimeout = 2_000 }
         val server = listener.accept()
@@ -273,22 +273,22 @@ class DriverSessionCatContractTest {
             )
             wire.writeI32(DriverProto.CMD_CAT_SET_MODE, 6)
 
+            assertCommandRejected(wire, DriverProto.CMD_CAT_SET_MODE)
             val mode = wire.read()!!
             assertEquals(DriverProto.EV_CAT_MODE_RESULT, mode.op)
             assertEquals(6, mode.payload.int)
             assertEquals(1, mode.payload.int)
             assertEquals(false, mode.payload.getBool())
-            assertCommandRejected(wire, DriverProto.CMD_CAT_SET_MODE)
 
             val controlRequest = ByteBuffer.allocate(8).putInt(12).putInt(3_200).apply { flip() }
             wire.write(DriverProto.CMD_CAT_SET_CONTROL, controlRequest)
+            assertCommandRejected(wire, DriverProto.CMD_CAT_SET_CONTROL)
             val control = wire.read()!!
             assertEquals(DriverProto.EV_CAT_CONTROL_RESULT, control.op)
             assertEquals(12, control.payload.int)
             assertEquals(3_200, control.payload.int)
             assertEquals(false, control.payload.getBool())
             assertEquals(false, control.payload.getBool())
-            assertCommandRejected(wire, DriverProto.CMD_CAT_SET_CONTROL)
         } finally {
             session.close()
             client.close()
