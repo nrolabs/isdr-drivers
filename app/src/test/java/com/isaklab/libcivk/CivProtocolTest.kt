@@ -163,7 +163,7 @@ class CivProtocolTest {
         assertEquals(P.ModeState(P.MODE_CW, false, 3), P.parseMode(bytes(P.MODE_CW, 3)))
         assertNull(P.parseMode(bytes()))
         assertNull(P.parseMode(bytes(P.MODE_USB, 1, 2)))
-        assertNull(P.parseModeData(bytes(0x00, P.MODE_USB, 0x02, 0x02)))
+        assertNull(P.parseModeData(bytes(0x00, P.MODE_USB, 0x04, 0x02)))
         assertNull(P.parseModeData(bytes(0x01, P.MODE_USB, 0x01, 0x02)))
         assertNull(P.parseMode(bytes(P.MODE_USB, 0)))
         assertArrayEquals(
@@ -274,16 +274,16 @@ class CivProtocolTest {
         // Codes 10..40 are 600..3600 in 100 Hz steps.
         assertEquals(10, P.widthCodeForMode(P.MODE_LSB, 600))
         assertEquals(28, P.widthCodeForMode(P.MODE_USB, 2400))
-        assertEquals(40, P.widthCodeForMode(P.MODE_RTTY_R, 3600))
-        // Snapping to the nearest code, clamped at the table ends.
-        assertEquals(0, P.widthCodeForMode(P.MODE_USB, 1))
-        assertEquals(28, P.widthCodeForMode(P.MODE_USB, 2380))
-        assertEquals(40, P.widthCodeForMode(P.MODE_USB, 90_000))
+        assertNull(P.widthCodeForMode(P.MODE_RTTY_R, 3600))
+        // Values outside the exact hardware grid are not silently rounded.
+        assertNull(P.widthCodeForMode(P.MODE_USB, 1))
+        assertNull(P.widthCodeForMode(P.MODE_USB, 2380))
+        assertNull(P.widthCodeForMode(P.MODE_USB, 90_000))
         // AM table: codes 0..49 are 200..10000 in 200 Hz steps.
         assertEquals(0, P.widthCodeForMode(P.MODE_AM, 200))
         assertEquals(29, P.widthCodeForMode(P.MODE_AM, 6000))
         assertEquals(49, P.widthCodeForMode(P.MODE_AM, 10_000))
-        assertEquals(49, P.widthCodeForMode(P.MODE_AM, 50_000))
+        assertNull(P.widthCodeForMode(P.MODE_AM, 50_000))
         // FM has no width command.
         assertNull(P.widthCodeForMode(P.MODE_FM, 12_000))
     }
@@ -439,15 +439,14 @@ class CivProtocolTest {
     @Test
     fun `scope fixed mode edges`() {
         val asm = P.ScopeAssembler(475)
-        val hdr = bytes(0x00, 0x01, 0x02, 0x01) + // fixed mode, 2 divisions
-            P.toBcdLe(7_000_000, 5)!! + P.toBcdLe(7_300_000, 5)!! + bytes(0x01)
-        assertNull(asm.push(hdr))
-        val line = asm.push(scopeChunk(0, 2, 2, bytes(1, 2, 3)))!!
+        val hdr = bytes(0x00, 0x01, 0x01, 0x01) + // fixed mode, complete LAN sweep
+            P.toBcdLe(7_000_000, 5)!! + P.toBcdLe(7_300_000, 5)!! + bytes(0x00)
+        val line = asm.push(hdr + ByteArray(475) { 7 })!!
         assertEquals(P.ScopeMode.FIXED, line.mode)
         assertEquals(7_000_000L, line.lowEdgeHz)
         assertEquals(7_300_000L, line.highEdgeHz)
-        assertTrue(line.outOfRange)
-        assertArrayEquals(bytes(1, 2, 3), line.bins)
+        assertFalse(line.outOfRange)
+        assertEquals(475, line.bins.size)
     }
 
     @Test
@@ -490,7 +489,7 @@ class CivProtocolTest {
 
         // The assembler recovers on the next clean sweep.
         assertNull(asm.push(scopeHeader(0, 2, 14_100_000, 250_000, 0)))
-        assertNotNull(asm.push(scopeChunk(0, 2, 2, ByteArray(40) { 9 })))
+        assertNotNull(asm.push(scopeChunk(0, 2, 2, ByteArray(100) { 9 })))
     }
 
     @Test
@@ -511,10 +510,10 @@ class CivProtocolTest {
         val asm = P.ScopeAssembler(100)
         assertNull(asm.push(scopeHeader(0, 2, 14_100_000, 250_000, 0)))
         assertNull(asm.push(scopeHeader(1, 2, 7_100_000, 25_000, 0)))
-        val sub = asm.push(scopeChunk(1, 2, 2, ByteArray(10) { 5 }))!!
+        val sub = asm.push(scopeChunk(1, 2, 2, ByteArray(100) { 5 }))!!
         assertEquals(1, sub.id)
         assertEquals(7_100_000L, sub.centerHz())
-        val main = asm.push(scopeChunk(0, 2, 2, ByteArray(10) { 6 }))!!
+        val main = asm.push(scopeChunk(0, 2, 2, ByteArray(100) { 6 }))!!
         assertEquals(0, main.id)
         assertEquals(14_100_000L, main.centerHz())
     }
@@ -528,4 +527,60 @@ class CivProtocolTest {
         // Above-scale values clamp instead of extrapolating.
         assertEquals(0f, db[3], 0f)
     }
+    @Test
+    fun `partial sweep never counts as a complete 475 bin spectrum`() {
+        val asm = P.ScopeAssembler(475)
+        assertNull(asm.push(scopeHeader(0, 1, 7_100_000, 25_000, 0) + ByteArray(474)))
+        assertEquals(1L, asm.dropped)
+    }
+
+    @Test
+    fun `scroll center carries absolute signed edges not center and span`() {
+        val negative = P.toBcdLe(25_000, 5)!!.also { it[4] = 0xF0.toByte() }
+        val data = bytes(0, 1, 1, 2) + negative + P.toBcdLe(75_000, 5)!! + bytes(0) + ByteArray(475)
+        val line = P.ScopeAssembler(475).push(data)!!
+        assertEquals(-25_000L, line.lowEdgeHz)
+        assertEquals(75_000L, line.highEdgeHz)
+        assertEquals(100_000L, line.spanHz())
+    }
+
+    @Test
+    fun `905 header frequency width is inferred for both center and scroll`() {
+        val center = bytes(0, 1, 1, 0) + P.toBcdLe(10_400_000_000, 6)!! +
+            P.toBcdLe(25_000_000, 5)!! + bytes(0) + ByteArray(475)
+        assertEquals(50_000_000L, P.ScopeAssembler(475).push(center, 0)!!.spanHz())
+        val scroll = bytes(0, 1, 1, 2) + P.toBcdLe(10_375_000_000, 6)!! +
+            P.toBcdLe(10_425_000_000, 6)!! + bytes(0) + ByteArray(475)
+        assertEquals(10_375_000_000L, P.ScopeAssembler(475).push(scroll, 0)!!.lowEdgeHz)
+        assertNull(P.ScopeAssembler(475).push(scroll.copyOf(scroll.size - 1), 0))
+    }
+
+    @Test
+    fun `7610 full LAN sweep survives deframer and uses every bin`() {
+        val data = scopeHeader(0, 1, 14_100_000, 250_000, 0) + ByteArray(689) { 200.toByte() }
+        val wire = P.buildFrame(P.CONTROLLER_ADDR, CivModels.ADDR_IC7610, bytes(P.CMD_SCOPE, P.SUB_SCOPE_WAVE) + data)!!
+        val body = P.Deframer().push(wire, wire.size).single()
+        val msg = P.parseFrame(body) as P.Frame.Message
+        val line = P.ScopeAssembler(689).push(msg.data.copyOfRange(1, msg.data.size))!!
+        assertEquals(689, line.bins.size)
+        assertEquals(0f, P.binsToDb(line.bins, 200, -100f, 0f).last(), 0f)
+    }
+
+    @Test
+    fun `out of range header is explicit state even without waveform divisions`() {
+        val line = P.ScopeAssembler(475).push(scopeHeader(0, 11, 7_100_000, 25_000, 1))!!
+        assertTrue(line.outOfRange)
+        assertEquals(0, line.bins.size)
+    }
+
+    @Test
+    fun `RTTY width ends at 2700 and D2 D3 survive mode codec`() {
+        assertNull(P.widthCodeForMode(P.MODE_RTTY, 3600))
+        assertNull(P.widthCodeForMode(P.MODE_RTTY_R, 3600))
+        for (dataMode in 2..3) {
+            assertEquals(dataMode, P.parseModeData(bytes(0, P.MODE_USB, dataMode, 2))!!.dataMode)
+            assertNotNull(P.writeModeData(CivModels.ADDR_IC7610, P.MODE_USB, dataMode, 2))
+        }
+    }
+
 }

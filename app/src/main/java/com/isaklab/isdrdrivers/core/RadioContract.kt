@@ -133,6 +133,9 @@ interface CatControlCapable {
 
     /** Apply one shared CATCTL_* receive control and confirm it. */
     fun setCatControl(id: Int, value: Int): Boolean
+
+    /** Details of an unconfirmed composed write, including rollback outcome. */
+    fun catControlError(): String? = null
 }
 
 /** A CAT rig with one proved, atomic repeater state transaction. */

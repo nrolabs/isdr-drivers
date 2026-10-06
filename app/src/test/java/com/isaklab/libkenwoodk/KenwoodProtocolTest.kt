@@ -68,10 +68,17 @@ class KenwoodProtocolTest {
         assertEquals("OM11;", P.setOm(1, P.MODE_LSB))
         assertEquals("OM0F;", P.setOm(0, P.MODE_AM_D))
         assertEquals("OM0A;", P.setOm(0, P.MODE_PSK))
-        // 0 and 8 are unassigned digits; nothing above F exists.
+        // 0 and 8 are unassigned; TS-990S adds G..N for DATA2/DATA3.
         assertNull(P.setOm(0, 0x0))
         assertNull(P.setOm(0, 0x8))
-        assertNull(P.setOm(0, 0x10))
+        assertEquals("OM0G;", P.setOm(0, P.MODE_LSB_D2))
+        assertEquals("OM1N;", P.setOm(1, P.MODE_AM_D3))
+        assertNull(P.setOm(0, 0x18))
+        assertTrue(!P.modeValidForModel(P.MODE_USB_D2, KenwoodModels.ID_TS890S))
+        assertTrue(P.modeValidForModel(P.MODE_USB_D2, KenwoodModels.ID_TS990S))
+        assertEquals(Pair(0, P.MODE_USB_D2), P.parseOm("OM0H"))
+        assertEquals(Pair(1, P.MODE_AM_D3), P.parseOm("OM1N"))
+        assertNull(P.parseOm("OM0O"))
 
         assertEquals(Pair(0, P.MODE_CW), P.parseOm("OM03"))
         assertEquals(Pair(1, P.MODE_FM_D), P.parseOm("OM1E"))
@@ -157,23 +164,60 @@ class KenwoodProtocolTest {
     }
 
     @Test
-    fun `meter enable report and swr calibration`() {
+    fun `meter grammar is banded and bounded`() {
+        assertEquals("SM0;", P.getSm(0))
+        assertEquals(59, P.parseSm("SM00059", 0))
+        assertNull(P.parseSm("SM10059", 0))
+        assertNull(P.parseSm("SM0059", 0))
+        assertNull(P.parseSm("SM00071", 0))
         assertEquals("RM11;", P.setRm(1, true))
         assertEquals("RM20;", P.setRm(2, false))
-        assertNull(P.setRm(10, true))
+        assertNull(P.setRm(0, true))
+        assertNull(P.setRm(7, true))
+        assertEquals("RM;", P.getRm2())
+        assertEquals(47, P.parseRm2("RM20047"))
+        assertNull(P.parseRm2("RM10047"))
         assertEquals(Pair(1, 23), P.parseRm("RM10023"))
         assertNull(P.parseRm("RM1002"))
         assertNull(P.parseRm("RM1002X"))
+        assertNull(P.parseRm("RM20071"))
+        assertNull(P.parseRm("RM70001"))
+    }
 
-        // The documented breakpoints, and linear interpolation between them.
-        assertEquals(1.0f, P.swrFromMeter(0), 0f)
-        assertEquals(1.5f, P.swrFromMeter(11), 0f)
-        assertEquals(2.0f, P.swrFromMeter(23), 0f)
-        assertEquals(3.0f, P.swrFromMeter(35), 0f)
-        assertTrue(P.swrFromMeter(70).isInfinite())
-        assertTrue(P.swrFromMeter(99).isInfinite())
-        val mid = P.swrFromMeter(17)
-        assertTrue("17 dots interpolates to ~1.75, got $mid", kotlin.math.abs(mid - 1.75f) < 0.01f)
+    @Test
+    fun `meters follow model Voice categories without linear power assumptions`() {
+        val a = KenwoodModels.ID_TS890S
+        val b = KenwoodModels.ID_TS990S
+        // Manufacturer Voice 2 tables, not the transmitter PC maximum.
+        assertEquals(50f, P.powerWatts(35, a)!!, 0f)
+        assertEquals(100f, P.powerWatts(36, b)!!, 0f)
+        assertEquals(100f, P.powerWatts(59, a)!!, 0f)
+        assertEquals(200f, P.powerWatts(60, b)!!, 0f)
+        assertEquals(150f, P.powerWatts(70, a)!!, 0f)
+        assertEquals(250f, P.powerWatts(70, b)!!, 0f)
+        assertEquals(17.5f, P.powerWatts(14, a)!!, 0f)
+        assertEquals(25f, P.powerWatts(15, a)!!, 0f)
+        assertEquals(1.1f, P.swrFromMeter(2, a)!!, 0f)
+        assertEquals(1f, P.swrFromMeter(2, b)!!, 0f)
+        assertEquals(1.6f, P.swrFromMeter(11, a)!!, 0f)
+        assertEquals(1.5f, P.swrFromMeter(11, b)!!, 0f)
+        assertEquals(2f, P.swrFromMeter(21, a)!!, 0f)
+        assertEquals(2.5f, P.swrFromMeter(25, b)!!, 0f)
+        for (model in intArrayOf(a, b)) {
+            assertEquals(0f, P.powerWatts(0, model)!!, 0f)
+            assertEquals(5f, P.swrFromMeter(47, model)!!, 0f)
+            assertTrue(P.swrFromMeter(48, model)!!.isInfinite())
+            assertTrue(P.swrFromMeter(70, model)!!.isInfinite())
+            assertNull(P.swrFromMeter(71, model))
+            assertNull(P.powerWatts(71, model))
+            assertNull(P.powerWatts(-1, model))
+            assertEquals(-73f, P.smeterDbm(36, model)!!, 0f)
+            assertEquals(-63f, P.smeterDbm(37, model)!!, 0f)
+            assertEquals(-13f, P.smeterDbm(70, model)!!, 0f)
+            assertNull(P.smeterDbm(71, model))
+        }
+        assertNull(P.powerWatts(35, 999))
+        assertNull(P.swrFromMeter(48, 999))
     }
 
     // ---- segment splitter ----------------------------------------------------
@@ -318,17 +362,18 @@ class KenwoodProtocolTest {
     }
 
     @Test
-    fun `lan dd2 clamps at the floor and maps db endpoints`() {
+    fun `lan dd2 rejects invalid amplitudes and maps documented endpoints`() {
         val seg = lanDd2 {
             when (it) {
                 0 -> 0x00
                 1 -> 0x8C
-                2 -> 0xFF // above the floor: clamps, never extrapolates
+                2 -> 0x8C
                 3 -> 0x46 // half scale
                 else -> 0x00
             }
         }
         val bins = P.parseLanDd2(seg)!!
+        assertNull(P.parseLanDd2(lanDd2 { if (it == 2) 0x8D else 0 }))
         assertEquals(0x8C, bins[2].toInt() and 0xFF)
         val db = P.binsToDb(bins)
         assertEquals(0.0f, db[0], 0f)
@@ -404,26 +449,26 @@ class KenwoodProtocolTest {
     @Test
     fun `dd4 header parses center and fixed shapes`() {
         // Centre mode: span 100 kHz around 14.1 MHz, in range.
-        var seg = "DD40%011d%011d0".format(100_000, 14_100_000)
-        assertEquals(27, seg.length)
+        var seg = "DD4000%011d%011d0".format(100_000, 14_100_000)
+        assertEquals(29, seg.length)
         var hdr = P.parseDd4Header(seg)!!
         assertEquals(P.BandscopeMode.CENTER, hdr.mode)
         assertEquals(100_000L, hdr.field1Hz)
         assertEquals(14_100_000L, hdr.field2Hz)
         assertTrue(!hdr.outOfRange)
         assertEquals(Pair(14_050_000L, 14_150_000L), hdr.edges(false))
-        assertEquals(Pair(14_000_000L, 14_200_000L), hdr.edges(true))
+        assertNull(hdr.edges(true))
 
         // Fixed mode: low/high edges, out of range.
-        seg = "DD41%011d%011d1".format(7_000_000, 7_300_000)
+        seg = "DD4001%011d%011d1".format(7_000_000, 7_300_000)
         hdr = P.parseDd4Header(seg)!!
         assertEquals(P.BandscopeMode.FIXED, hdr.mode)
         assertTrue(hdr.outOfRange)
         assertEquals(Pair(7_000_000L, 7_300_000L), hdr.edges(false))
 
         // Unknown scope-mode digit, and a short frame.
-        assertNull(P.parseDd4Header("DD43%011d%011d0".format(7_000_000, 7_300_000)))
-        assertNull(P.parseDd4Header("DD40%011d%010d0".format(100_000, 14_100_000)))
+        assertNull(P.parseDd4Header("DD4003%011d%011d0".format(7_000_000, 7_300_000)))
+        assertNull(P.parseDd4Header("DD4000%011d%010d0".format(100_000, 14_100_000)))
     }
 
     @Test
@@ -436,15 +481,17 @@ class KenwoodProtocolTest {
 
         assertEquals("BS4;", P.getBs4())
         assertEquals("BS42;", P.setBs4(2))
-        assertNull(P.setBs4(7))
+        assertEquals("BS47;", P.setBs4(7))
+        assertNull(P.setBs4(8))
         assertEquals(0, P.parseBs4("BS40"))
         assertEquals(6, P.parseBs4("BS46"))
-        assertNull(P.parseBs4("BS47"))
+        assertEquals(7, P.parseBs4("BS47"))
+        assertNull(P.parseBs4("BS48"))
         assertEquals(25_000L, KenwoodModels.TS890_BS4_SPANS_HZ[2])
         assertEquals(20_000L, KenwoodModels.TS990_BS4_SPANS_HZ[2])
-        assertEquals(500_000L, KenwoodModels.TS990_BS4_SPANS_HZ[6])
+        assertEquals(500_000L, KenwoodModels.TS990_BS4_SPANS_HZ[7])
 
-        assertEquals("BSM0;", P.getBsm0())
+        assertEquals("BSM;", P.getBsm0())
         assertEquals(Pair(7_000_000L, 7_300_000L), P.parseBsm0("BSM00700000007300000"))
         assertNull(P.parseBsm0("BSM00730000007000000")) // inverted
         assertNull(P.parseBsm0("BSM0070000000730000"))
@@ -465,23 +512,19 @@ class KenwoodProtocolTest {
             Pair(14_050_000L, 14_150_000L),
             P.deriveEdges(P.BandscopeMode.CENTER, 14_100_000, 100_000L, null, false),
         )
-        // EXPAND on: the streamed data covers more than the displayed span;
-        // the derived span widens by the documented lower-bound factor.
-        assertEquals(
-            Pair(14_000_000L, 14_200_000L),
-            P.deriveEdges(P.BandscopeMode.CENTER, 14_100_000, 100_000L, null, true),
-        )
+        // The manual only says 2–3x; no invented axis for EXPAND.
+        assertNull(P.deriveEdges(P.BandscopeMode.CENTER, 14_100_000, 100_000L, null, true))
         // Fixed and auto-scroll use the BSM0 limits.
         assertEquals(
             Pair(7_000_000L, 7_300_000L),
             P.deriveEdges(P.BandscopeMode.FIXED, 0, null, Pair(7_000_000L, 7_300_000L), false),
         )
-        assertEquals(
-            Pair(6_850_000L, 7_450_000L),
-            P.deriveEdges(
-                P.BandscopeMode.AUTO_SCROLL, 0, null, Pair(7_000_000L, 7_300_000L), true,
-            ),
-        )
+        assertNull(P.deriveEdges(
+            P.BandscopeMode.AUTO_SCROLL, 0, null, Pair(7_000_000L, 7_300_000L), true,
+        ))
+        assertEquals(Pair(7_000_000L, 7_300_001L), P.deriveEdges(
+            P.BandscopeMode.AUTO_SCROLL, 0, null, Pair(7_000_000L, 7_300_001L), false,
+        ))
         // Missing or degenerate inputs derive nothing.
         assertNull(P.deriveEdges(P.BandscopeMode.CENTER, 14_100_000, null, null, false))
         assertNull(P.deriveEdges(P.BandscopeMode.CENTER, 0, 100_000L, null, false))
@@ -587,11 +630,11 @@ class KenwoodProtocolTest {
         assertEquals("FL01;", P.setFl0(null, 1))
         assertEquals("FL02;", P.setFl0(null, 2))
         assertNull(P.setFl0(null, 3))
-        // The answer carries the trailing 270 Hz-option digit; a bare
-        // selection digit is also accepted.
+        // TS-890S requires its trailing 270 Hz-option digit.
         assertEquals(1, P.parseFl0("FL011", null))
         assertEquals(2, P.parseFl0("FL020", null))
-        assertEquals(0, P.parseFl0("FL00", null))
+        assertNull(P.parseFl0("FL00", null))
+        assertEquals(0, P.parseFl0("FL000", null))
         assertNull(P.parseFl0("FL03", null))
         assertNull(P.parseFl0("FL012x", null))
         assertNull(P.parseFl0("FL0", null))
@@ -599,7 +642,7 @@ class KenwoodProtocolTest {
     }
 
     @Test
-    fun `sl width ladders snap per mode`() {
+    fun `sl width ladders require exact Hz in the physical mode`() {
         assertEquals("SL0;", P.getSl0(null))
         assertEquals("SL000;", P.setSl0(null, 0))
         assertEquals("SL018;", P.setSl0(null, 18))
@@ -611,15 +654,17 @@ class KenwoodProtocolTest {
 
         // CW ladder: code = index into the documented width table.
         assertEquals(Pair(0, 50), P.slWidthCode(P.MODE_CW, 50))
-        assertEquals(Pair(10, 500), P.slWidthCode(P.MODE_CW, 510))
-        assertEquals(Pair(18, 2500), P.slWidthCode(P.MODE_CW_R, 9_000))
+        assertEquals(Pair(10, 500), P.slWidthCode(P.MODE_CW, 500))
+        assertNull(P.slWidthCode(P.MODE_CW, 510))
+        assertNull(P.slWidthCode(P.MODE_CW_R, 9_000))
         // FSK ladder.
-        assertEquals(Pair(0, 250), P.slWidthCode(P.MODE_FSK, 100))
-        assertEquals(Pair(6, 1000), P.slWidthCode(P.MODE_FSK_R, 900))
+        assertNull(P.slWidthCode(P.MODE_FSK, 100))
+        assertNull(P.slWidthCode(P.MODE_FSK_R, 900))
         assertEquals(Pair(7, 1500), P.slWidthCode(P.MODE_FSK, 1500))
         // PSK ladder.
         assertEquals(Pair(26, 3000), P.slWidthCode(P.MODE_PSK, 3000))
-        assertEquals(Pair(16, 1200), P.slWidthCode(P.MODE_PSK_R, 1250))
+        assertEquals(Pair(16, 1200), P.slWidthCode(P.MODE_PSK_R, 1200))
+        assertNull(P.slWidthCode(P.MODE_PSK_R, 1250))
         // Modes where SL is a cut frequency (or menu-dependent) have no ladder.
         assertNull(P.slWidthCode(P.MODE_USB, 2400))
         assertNull(P.slWidthCode(P.MODE_AM, 6000))
@@ -665,6 +710,7 @@ class KenwoodProtocolTest {
         assertEquals("FL00;", P.getFl0(0))
         assertEquals("FL001;", P.setFl0(0, 1))
         assertEquals(1, P.parseFl0("FL001", 0))
+        assertNull(P.parseFl0("FL0010", 0))
 
         // TS-890S setting-type 0 and TS-990S Main band 0 share these bytes.
         assertEquals("SL0;", P.getSl0(0))
@@ -719,4 +765,85 @@ class KenwoodProtocolTest {
         assertNull(P.parseTn("TN50", null))
         assertNull(P.setTn(null, 600))
     }
+    @Test
+    fun `operating bank scope bank firmware and TFSET are distinct strict fields`() {
+        assertEquals("CB;", P.getCb())
+        assertEquals("CB0;", P.setCb(0))
+        assertEquals(1, P.parseCb("CB1"))
+        assertNull(P.setCb(2))
+        assertNull(P.parseCb("CB10"))
+        assertEquals("BS21;", P.setBs2(1))
+        assertEquals("BS2;", P.getBs2())
+        assertEquals(0, P.parseBs2("BS20"))
+        assertNull(P.parseBs2("CB0"))
+        assertEquals("TS;", P.getTs())
+        assertEquals(true, P.parseTs("TS1"))
+        assertNull(P.parseTs("TS2"))
+        assertEquals("FV;", P.getFv())
+        assertEquals(120, P.parseFv("FV1.20"))
+        assertEquals(113, P.parseFv("FV1.13"))
+        assertNull(P.parseFv("FV120"))
+        assertNull(P.parseFv("FV1.2"))
+        assertNull(P.parseFv("FV1.20x"))
+        assertEquals("BS5;", P.getBs5())
+        assertEquals(Pair(7_000_000L, 7_300_000L), P.parseBs5("BS50700000007300000"))
+        assertNull(P.parseBs5("BS50730000007000000"))
+    }
+
+    @Test
+    fun `firmware selects model tables without inventing unknown geometry`() {
+        val a = KenwoodModels.resolveScopeModel(KenwoodModels.ID_TS890S, null)!!
+        val old = KenwoodModels.resolveScopeModel(KenwoodModels.ID_TS990S, 113)!!
+        val current = KenwoodModels.resolveScopeModel(KenwoodModels.ID_TS990S, 120)!!
+        assertEquals(25_000L, a.bs4SpansHz[2])
+        assertEquals(50_000L, old.bs4SpansHz[3])
+        assertEquals(30_000L, current.bs4SpansHz[3])
+        assertEquals(500_000L, old.bs4SpansHz[6])
+        assertEquals(500_000L, current.bs4SpansHz[7])
+        assertEquals(300, P.slWidthTable(P.MODE_CW, old.slLegacy)!![6])
+        assertEquals(400, P.slWidthTable(P.MODE_CW, old.slLegacy)!![7])
+        assertEquals(350, P.slWidthTable(P.MODE_CW, current.slLegacy)!![7])
+        assertEquals(Pair(2, 400), P.slWidthCode(P.MODE_FSK, 400, old.slLegacy))
+        assertEquals(Pair(3, 400), P.slWidthCode(P.MODE_FSK, 400, current.slLegacy))
+        assertNull(P.slWidthCode(P.MODE_PSK, 3000, old.slLegacy))
+        for (version in listOf(null, 99, 114, 119)) {
+            val model = KenwoodModels.resolveScopeModel(KenwoodModels.ID_TS990S, version)!!
+            assertTrue(model.bs4SpansHz.isEmpty())
+            assertNull(model.slLegacy)
+            assertNull(P.slWidthTable(P.MODE_CW, model.slLegacy))
+        }
+    }
+
+    @Test
+    fun `DD4 requires split00 header and exactly32 contiguous pieces`() {
+        val header = "DD4000%011d%011d0".format(100_000, 14_100_000)
+        fun chunk(split: Int, bins: Int = 20) = "DD4%02d".format(split) + "46".repeat(bins)
+        assertNull(P.parseDd4Header("DD40%011d%011d0".format(100_000, 14_100_000)))
+        assertNull(P.parseDd4Header(header.dropLast(1) + "2"))
+        assertNull(P.parseDd4Split(chunk(0)))
+        assertNull(P.parseDd4Split(chunk(33)))
+        assertNull(P.parseDd4Split(chunk(32, 19)))
+        val assembler = P.Dd4ScopeAssembler()
+        assertNull(assembler.push(header))
+        for (split in 1..31) assertNull(assembler.push(chunk(split)))
+        val sweep = assembler.push(chunk(32))!!
+        assertEquals(Pair(14_050_000L, 14_150_000L), sweep.header.edges(false))
+        assertEquals(640, sweep.bins.size)
+        assertTrue(sweep.bins.all { it == 0x46.toByte() })
+        assertNull(assembler.push(chunk(32)))
+        assembler.push(header)
+        assembler.push(chunk(1))
+        assembler.push(chunk(3)) // missing02 invalidates the whole sweep
+        for (split in 4..32) assertNull(assembler.push(chunk(split)))
+        assembler.push(header)
+        for (split in 1..31) assembler.push(chunk(split))
+        assertNull(assembler.push(chunk(32, 19)))
+        // OOR is delivered immediately, with its exact fixed edges and no stale bins.
+        val oor = assembler.push("DD4001%011d%011d1".format(7_000_000, 7_300_000))!!
+        assertTrue(oor.header.outOfRange)
+        assertTrue(oor.bins.isEmpty())
+        assertEquals(Pair(7_000_000L, 7_300_000L), oor.header.edges(false))
+        for (split in 1..32) assertNull(assembler.push(chunk(split)))
+    }
+
 }

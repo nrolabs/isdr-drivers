@@ -73,6 +73,9 @@ class KenwoodClientTest {
                 val entry = replies.firstOrNull { it.first == cmd }
                 if (entry != null && entry.second.isNotEmpty()) {
                     entry.second.removeFirst().toByteArray().forEach { inbox.add(it) }
+                } else if (cmd == "FR;") {
+                    // Static VFO A receive unless a test scripts a physical bank transition.
+                    "FR0;".toByteArray().forEach { inbox.add(it) }
                 }
             }
         }
@@ -123,11 +126,14 @@ class KenwoodClientTest {
         h.on("##CN;", "##CN1;")
         h.on("##ID00705kenwoodadmin;", "##ID1;")
         h.on("ID;", "ID024;")
+        h.on("RX;", "RX;")
+        h.on("BSO;", "BSO0;")
+        h.on("DD0;", "DD01;")
         h.on("FA;", "FA00014100000;")
         h.on("OM0;", "OM02;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS44;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
     }
 
@@ -136,33 +142,72 @@ class KenwoodClientTest {
         h.on("##ID00705kenwoodadmin;", "##ID0;")
         h.on("##ID75kenwoodadmin;", "##ID1;")
         h.on("ID;", "ID023;")
+        h.on("RX;", "RX;")
+        h.on("FV;", "FV1.20;")
+        h.on("BS2;", "BS20;")
+        h.on("BS5;", "BS50700000007300000;")
+        h.on("DD0;", "DD01;")
         h.on("FA;", "FA00007074000;")
         h.on("OM0;", "OM01;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS42;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
     }
 
     /** Serial TS-890S session: no handshake, same identification and polls. */
     private fun scriptSerialTs890(h: FakeRig) {
         h.on("ID;", "ID024;")
+        h.on("RX;", "RX;")
+        h.on("BSO;", "BSO0;")
+        h.on("DD0;", "DD04;")
         h.on("FA;", "FA00014100000;")
         h.on("OM0;", "OM02;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS44;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
     }
 
     private fun scriptSerialTs990(h: FakeRig) {
         h.on("ID;", "ID023;")
+        h.on("RX;", "RX;")
+        h.on("FV;", "FV1.20;")
+        h.on("BS2;", "BS20;")
+        h.on("BS5;", "BS50700000007300000;")
+        h.on("DD0;", "DD02;")
         h.on("FA;", "FA00007074000;")
         h.on("OM0;", "OM01;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS42;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
+    }
+
+    private fun scriptNr(h: FakeRig, band: String, beforeMode: Int, beforeLevel: Int, mode: Int, level: Int) {
+        h.on("NR$band;", "NR$band$beforeMode;")
+        h.on("RL1$band;", "RL1$band${"%02d".format(beforeLevel)};")
+        h.on("NR$band;", "NR$band$mode;")
+        if (mode != 0) h.on("RL1$band;", "RL1$band${"%02d".format(level)};")
+        h.on("NR$band;", "NR$band$mode;")
+        h.on("RL1$band;", "RL1$band${"%02d".format(level)};")
+    }
+
+    private fun scriptCb(h: FakeRig, original: Int = 0) {
+        h.on("CB;", "CB$original;")
+        if (original != 0) h.on("CB;", "CB0;")
+        h.on("CB;", "CB0;")
+        h.on("CB;", "CB$original;")
+    }
+
+    private fun scriptWidth(h: FakeRig, band: String = "", mode: String = "3", code: String? = null, afterMode: String = mode) {
+        h.on("OM0;", "OM0$mode;")
+        h.on("FL0$band;", if (band.isEmpty()) "FL000;" else "FL000;")
+        if (code != null) {
+            h.on("SL0;", "SL0$code;")
+            h.on("OM0;", "OM0$afterMode;")
+            h.on("FL0$band;", "FL000;")
+        }
     }
 
     private fun repeaterConfig() = CatRepeaterConfig(
@@ -231,7 +276,7 @@ class KenwoodClientTest {
         written = h.written()
         assertTrue(written.contains("AI2;"))
         assertTrue(written.contains("DD01;"))
-        for (poll in listOf("FA;", "OM0;", "BS3;", "BS4;", "BSM0;", "BSO;")) {
+        for (poll in listOf("FA;", "OM0;", "BS3;", "BS4;", "BSM;", "BSO;")) {
             assertTrue("missing $poll", written.contains(poll))
         }
         // AI precedes the scope stream enable.
@@ -270,6 +315,11 @@ class KenwoodClientTest {
     fun `required numeric model id mismatch writes nothing after ID`() {
         val h = FakeRig()
         h.on("ID;", "ID023;")
+        h.on("RX;", "RX;")
+        h.on("FV;", "FV1.20;")
+        h.on("BS2;", "BS20;")
+        h.on("BS5;", "BS50700000007300000;")
+        h.on("DD0;", "DD01;")
         val (c, cap) = makeClient(
             h,
             Link.SERIAL,
@@ -348,11 +398,16 @@ class KenwoodClientTest {
         h.on("##ID00705kenwoodadmin;", "##ID0;")
         h.on("##ID75kenwoodadmin;", "##ID1;")
         h.on("ID;", "ID023;")
+        h.on("RX;", "RX;")
+        h.on("FV;", "FV1.20;")
+        h.on("BS2;", "BS20;")
+        h.on("BS5;", "BS50700000007300000;")
+        h.on("DD0;", "DD01;")
         h.on("FA;", "FA00007074000;")
         h.on("OM0;", "OM01;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS42;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
@@ -363,7 +418,8 @@ class KenwoodClientTest {
         assertEquals(Pair(7_064_000L, 7_084_000L), c.scopeEdges())
 
         h.on("BS4;", "BS42;")
-        c.setSampleRate(21_000)
+        h.on("BS3;", "BS30;")
+        c.setSampleRate(20_000)
         assertEquals(20_000, c.sampleRateHz())
         assertEquals(1, h.writesOf("BS42;"))
 
@@ -423,13 +479,13 @@ class KenwoodClientTest {
     }
 
     @Test
-    fun `serial connect uses the unlinked scope mode`() {
+    fun `serial connect uses AI linked scope mode`() {
         val h = FakeRig()
         scriptSerialTs890(h)
         val (c, _) = makeClient(h, Link.SERIAL, null)
         assertTrue(connect(c))
-        waitUntil { h.writesOf("DD05;") == 1 }
-        assertEquals(1, h.writesOf("DD05;"))
+        waitUntil { h.writesOf("DD04;") == 1 }
+        assertEquals(1, h.writesOf("DD04;"))
         assertEquals(0, h.writesOf("##CN;"))
         c.disconnect()
     }
@@ -559,6 +615,7 @@ class KenwoodClientTest {
         scriptLanTs890(h)
         val (c, cap) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
+        h.on("DD0;", "DD00;")
         c.spectrumEnabled = false
         waitUntil { h.writesOf("DD00;") == 1 }
         assertEquals(1, h.writesOf("DD00;"))
@@ -599,18 +656,18 @@ class KenwoodClientTest {
 
         // CAT code 3 = CW, OM digit 3.
         h.on("OM0;", "OM03;")
-        assertTrue(c.setMode(3))
+        repeat(2) { h.on("TS;", "TS0;") }; assertTrue(c.setMode(3))
         assertEquals(1, h.writesOf("OM03;"))
         assertEquals(P.MODE_CW, c.mode())
 
         // CAT code 5 = FM, OM digit 4 (the tables differ here).
         h.on("OM0;", "OM04;")
-        assertTrue(c.setMode(5))
+        repeat(2) { h.on("TS;", "TS0;") }; assertTrue(c.setMode(5))
         assertEquals(1, h.writesOf("OM04;"))
         assertEquals(P.MODE_FM, c.mode())
 
         // A CAT code with no OM equivalent is refused without traffic.
-        assertFalse(c.setMode(6))
+        repeat(2) { h.on("TS;", "TS0;") }; assertFalse(c.setMode(6))
         assertEquals(0, h.writesOf("OM06;"))
         c.disconnect()
     }
@@ -631,14 +688,14 @@ class KenwoodClientTest {
         )) {
             val digit = om.toString(16).uppercase()
             h.on("OM0;", "OM0$digit;")
-            assertTrue(c.setCatMode(requested))
+            repeat(2) { h.on("TS;", "TS0;") }; assertTrue(c.setCatMode(requested))
             assertEquals(1, h.writesOf("OM0$digit;"))
             assertEquals(om, c.mode())
             assertEquals(requested, c.currentCatMode())
         }
 
         h.on("OM0;", "OM02;")
-        assertTrue(c.setCatMode(1))
+        repeat(2) { h.on("TS;", "TS0;") }; assertTrue(c.setCatMode(1))
         assertEquals(P.MODE_USB, c.mode())
         assertEquals(1, c.currentCatMode())
         c.disconnect()
@@ -653,7 +710,7 @@ class KenwoodClientTest {
 
         val data = DriverProto.CAT_MODE_DATA_FLAG
         h.on("OM0;", "OM02;")
-        assertFalse(c.setCatMode(data or 1))
+        repeat(2) { h.on("TS;", "TS0;") }; assertFalse(c.setCatMode(data or 1))
         assertEquals(1, h.writesOf("OM0D;"))
         assertEquals(P.MODE_USB, c.mode())
         assertEquals(1, c.currentCatMode())
@@ -661,7 +718,7 @@ class KenwoodClientTest {
         waitUntil { h.writesOf("DD01;") == 1 }
         val before = h.written().size
         for (invalid in listOf(6, data or 3, data or 4, data or 7, 0x200 or 1)) {
-            assertFalse(c.setCatMode(invalid))
+            repeat(2) { h.on("TS;", "TS0;") }; assertFalse(c.setCatMode(invalid))
         }
         assertEquals(before, h.written().size)
         c.disconnect()
@@ -745,7 +802,7 @@ class KenwoodClientTest {
         assertTrue(result[0]!!, result[0]!!.contains("uncertain"))
         assertTrue("priority unkey took ${elapsedMs}ms", elapsedMs < 500)
         val written = h.written()
-        assertTrue(written.indexOf("FB00014700000;") < written.indexOf("RX;"))
+        assertTrue(written.indexOf("FB00014700000;") < written.lastIndexOf("RX;"))
         assertEquals(0, h.writesOf("FB00014200000;")) // no slow rollback before unkey
         c.disconnect()
     }
@@ -798,8 +855,9 @@ class KenwoodClientTest {
         assertTrue(written.contains("FT1;"))
         assertEquals(0, h.writesOf("FA00014250000;"))
 
+        val txWrites = written.drop(written.indexOf("FB00014250000;"))
         val order = listOf("FB00014250000;", "FB;", "FR0;", "FR;", "FT1;", "FT;")
-            .map { written.indexOf(it) }
+            .map { txWrites.indexOf(it) }
         assertTrue(order.all { it >= 0 })
         assertTrue(order.zipWithNext().all { (a, b) -> a < b })
         c.disconnect()
@@ -841,25 +899,21 @@ class KenwoodClientTest {
     }
 
     @Test
-    fun `set sample rate snaps to the bs4 ladder`() {
+    fun `set sample rate requires an exact confirmed center span`() {
         val h = FakeRig()
         scriptLanTs890(h)
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
-
-        // 30 kHz asks for the nearest rung, 25 kHz (code 2).
+        h.on("BS3;", "BS30;")
         h.on("BS4;", "BS42;")
-        c.setSampleRate(30_000)
+        c.setSampleRate(25_000)
         assertEquals(25_000, c.sampleRateHz())
-        assertEquals(1, h.writesOf("BS42;"))
-        // The edges follow the new span around the tuned frequency.
         assertEquals(Pair(14_087_500L, 14_112_500L), c.scopeEdges())
-
-        // 1 MHz clamps onto the top rung, 500 kHz.
-        h.on("BS4;", "BS46;")
-        c.setSampleRate(1_000_000)
-        assertEquals(500_000, c.sampleRateHz())
-        assertEquals(1, h.writesOf("BS46;"))
+        try { c.setSampleRate(30_000); throw AssertionError("unsupported span accepted") }
+        catch (_: IllegalArgumentException) {}
+        h.on("BS3;", "BS31;")
+        try { c.setSampleRate(50_000); throw AssertionError("FIX accepted a CENTER span") }
+        catch (_: IllegalStateException) {}
         c.disconnect()
     }
 
@@ -969,11 +1023,16 @@ class KenwoodClientTest {
         h.on("##ID00705kenwoodadmin;", "##ID0;")
         h.on("##ID75kenwoodadmin;", "##ID1;")
         h.on("ID;", "ID023;")
+        h.on("RX;", "RX;")
+        h.on("FV;", "FV1.20;")
+        h.on("BS2;", "BS20;")
+        h.on("BS5;", "BS50700000007300000;")
+        h.on("DD0;", "DD01;")
         h.on("FA;", "FA00007074000;")
         h.on("OM0;", "OM01;")
         h.on("BS3;", "BS30;")
         h.on("BS4;", "BS42;")
-        h.on("BSM0;", "BSM00700000007300000;")
+        h.on("BSM;", "BSM00700000007300000;")
         h.on("BSO;", "BSO0;")
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
@@ -993,7 +1052,7 @@ class KenwoodClientTest {
         assertTrue(connect(c))
 
         h.on("FL00;", "FL001;")
-        assertTrue(c.setControl(1, 2))
+        repeat(2) { h.on("OM0;", "OM02;") }; assertTrue(c.setControl(1, 2))
         assertEquals(1, h.writesOf("FL001;"))
 
         h.on("RG0;", "RG0042;")
@@ -1006,8 +1065,7 @@ class KenwoodClientTest {
         assertTrue(c.setControl(13, 44))
         assertEquals(1, h.writesOf("AG0044;"))
 
-        h.on("NR0;", "NR01;")
-        h.on("RL10;", "RL1001;")
+        scriptNr(h, "0", 0, 5, 1, 1)
         assertTrue(c.setControl(4, 1))
         assertEquals(1, h.writesOf("NR01;"))
         assertEquals(1, h.writesOf("RL1001;"))
@@ -1025,13 +1083,15 @@ class KenwoodClientTest {
         h.on("PA;", "PA01;")
         assertTrue(c.setControl(8, 1))
         assertEquals(1, h.writesOf("PA01;"))
+        scriptCb(h)
         h.on("RA0;", "RA02;")
-        assertTrue(c.setControl(9, 10))
+        assertTrue(c.setControl(9, 12))
         assertEquals(1, h.writesOf("RA02;"))
 
+        scriptCb(h)
         h.on("OM0;", "OM03;")
-        assertTrue(c.setMode(3))
-        h.on("SL0;", "SL000;")
+        repeat(2) { h.on("TS;", "TS0;") }; assertTrue(c.setMode(3))
+        scriptWidth(h, "0", code = "00")
         assertTrue(c.setControl(12, 50))
         assertEquals(1, h.writesOf("SL000;"))
         c.disconnect()
@@ -1064,36 +1124,17 @@ class KenwoodClientTest {
     }
 
     @Test
-    fun `set control nr drives nr1 and its rl1 level`() {
+    fun `set control nr drives a confirmed mode and level pair`() {
         val h = FakeRig()
         scriptLanTs890(h)
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
-
-        // 0 turns NR off; no RL1 traffic.
-        h.on("NR;", "NR0;")
+        scriptNr(h, "", 1, 5, 0, 5)
         assertTrue(c.setControl(4, 0))
-        assertEquals(1, h.writesOf("NR0;"))
-        assertTrue(h.written().all { !it.startsWith("RL1") || it == "RL1;" })
-
-        // 15 = maximum: NR1 on, RL1 level 10.
-        h.on("NR;", "NR1;")
-        h.on("RL1;", "RL110;")
+        scriptNr(h, "", 0, 5, 1, 10)
         assertTrue(c.setControl(4, 15))
-        assertEquals(1, h.writesOf("NR1;"))
-        assertEquals(1, h.writesOf("RL110;"))
-
-        // 1 = minimum audible: RL1 level 01.
-        h.on("NR;", "NR1;")
-        h.on("RL1;", "RL101;")
+        scriptNr(h, "", 1, 10, 1, 1)
         assertTrue(c.setControl(4, 1))
-        assertEquals(1, h.writesOf("RL101;"))
-
-        // The rig staying off on read-back fails the set before any RL1 write.
-        h.on("NR;", "NR0;")
-        assertFalse(c.setControl(4, 8))
-        assertEquals(0, h.writesOf("RL106;"))
-
         assertFalse(c.setControl(4, 16))
         c.disconnect()
     }
@@ -1128,17 +1169,17 @@ class KenwoodClientTest {
 
         // CATCTL_ATT: 10 dB snaps onto the 12 dB step (RA2).
         h.on("RA;", "RA2;")
-        assertTrue(c.setControl(9, 10))
+        assertTrue(c.setControl(9, 12))
         assertEquals(1, h.writesOf("RA2;"))
 
         // CATCTL_FIL: app filter 2 = FL01 (B); the answer carries the
         // 270 Hz-option digit.
         h.on("FL0;", "FL011;")
-        assertTrue(c.setControl(1, 2))
+        repeat(2) { h.on("OM0;", "OM02;") }; assertTrue(c.setControl(1, 2))
         assertEquals(1, h.writesOf("FL01;"))
         // Selection C refused by the rig (two-filter menu): mismatch fails.
         h.on("FL0;", "FL011;")
-        assertFalse(c.setControl(1, 3))
+        repeat(2) { h.on("OM0;", "OM02;") }; assertFalse(c.setControl(1, 3))
 
         assertFalse(c.setControl(5, 2))
         assertFalse(c.setControl(6, -1))
@@ -1149,32 +1190,21 @@ class KenwoodClientTest {
     }
 
     @Test
-    fun `set control filter width follows the mode ladders`() {
+    fun `filter width uses fresh mode and rejects rounding or changing contexts`() {
         val h = FakeRig()
         scriptLanTs890(h)
         val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
         assertTrue(connect(c))
-
-        // Session mode is USB (OM02): SL is a cut frequency there, not a
-        // width — refused without traffic.
+        scriptWidth(h, mode = "2")
         assertFalse(c.setControl(12, 2400))
-        assertEquals(0, h.writesOf("SL0;"))
-
-        // In CW the SL parameter is the passband width: 500 Hz = ID 10.
-        h.on("OM0;", "OM03;")
-        assertTrue(c.setMode(3))
-        h.on("SL0;", "SL010;")
+        // The physical mode has changed without an AI report. Read it now.
+        scriptWidth(h, code = "10")
         assertTrue(c.setControl(12, 500))
-        assertEquals(1, h.writesOf("SL010;"))
-
-        // 460 Hz snaps to the nearest rung, 450 Hz (ID 09).
-        h.on("SL0;", "SL009;")
-        assertTrue(c.setControl(12, 460))
-        assertEquals(1, h.writesOf("SL009;"))
-
-        // A mismatching read-back fails the set.
-        h.on("SL0;", "SL005;")
+        scriptWidth(h)
+        assertFalse(c.setControl(12, 460))
+        scriptWidth(h, code = "02", afterMode = "7")
         assertFalse(c.setControl(12, 100))
+        assertEquals(7, c.mode())
         c.disconnect()
     }
 
@@ -1200,4 +1230,236 @@ class KenwoodClientTest {
         assertEquals(before, h.written().size)
         c.disconnect()
     }
+    @Test
+    fun `ts990 mode selects main restores control band and ignores sub reports`() {
+        val h = FakeRig()
+        scriptLanTs990(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        h.pushUnsolicited("OM1N;OM0H;")
+        waitUntil { c.mode() == 17 }
+        assertEquals(DriverProto.CAT_MODE_DATA_FLAG or 1, c.currentCatMode())
+        scriptCb(h, 1)
+        repeat(2) { h.on("TS;", "TS0;") }
+        h.on("OM0;", "OM1D;OM0D;")
+        assertTrue(c.setMode(DriverProto.CAT_MODE_DATA_FLAG or 1))
+        val writes = h.written()
+        assertTrue(writes.indexOf("CB0;") < writes.indexOf("OM0D;"))
+        assertTrue(writes.indexOf("OM0D;") < writes.lastIndexOf("CB1;"))
+        assertEquals(13, c.mode())
+        c.disconnect()
+    }
+
+    @Test
+    fun `mode refuses TF SET and uncertain control band restoration`() {
+        val h = FakeRig()
+        scriptLanTs990(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        scriptCb(h, 1)
+        h.on("TS;", "TS1;")
+        assertFalse(c.setMode(3))
+        assertEquals(0, h.writesOf("OM03;"))
+        h.on("CB;", "CB1;")
+        h.on("CB;", "CB0;")
+        h.on("CB;", "CB0;")
+        h.on("CB;", "CB0;") // restoration failed
+        repeat(2) { h.on("TS;", "TS0;") }
+        h.on("OM0;", "OM03;")
+        assertFalse(c.setMode(3))
+        assertTrue(c.catControlError()!!.contains("restoration"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `nr failed second write restores mode and stored level or reports uncertainty`() {
+        for (rollbackOk in listOf(true, false)) {
+            val h = FakeRig()
+            scriptLanTs890(h)
+            val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+            assertTrue(connect(c))
+            h.on("NR;", "NR2;"); h.on("RL1;", "RL104;")
+            h.on("NR;", "NR1;"); h.on("RL1;", "RL103;") // rejected desired10
+            h.on("RL1;", if (rollbackOk) "RL104;" else "RL103;")
+            h.on("NR;", "NR2;")
+            h.on("NR;", "NR2;"); h.on("RL1;", if (rollbackOk) "RL104;" else "RL103;")
+            assertFalse(c.setControl(4, 15))
+            assertEquals(1, h.writesOf("RL104;"))
+            assertEquals(1, h.writesOf("NR2;"))
+            assertTrue(c.catControlError()!!.contains(if (rollbackOk) "was restored" else "uncertain"))
+            c.disconnect()
+        }
+    }
+
+    @Test
+    fun `physical controls preserve mode ordering and unrepresentable NR`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val events = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val c = KenwoodClient(h, Link.LAN, Pair("kenwood", "admin"), { _, _ -> }, { _, _ -> },
+            onControl = { id, value -> events.add("$id=$value") })
+        c.setStateListener { events.add("mode") }
+        assertTrue(connect(c))
+        events.clear()
+        h.pushUnsolicited("FL000;OM03;FL000;NR2;NR1;RL110;RG123;")
+        waitUntil { events.contains("2=123") }
+        assertEquals(listOf("1=1", "mode", "1=1", "4=-1", "4=15", "2=123"), events.toList())
+        c.disconnect()
+    }
+
+    @Test
+    fun `poller publishes paired manual meters including OVER and missing SWR`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val meters = java.util.concurrent.CopyOnWriteArrayList<com.isaklab.isdrproto.RadioTelemetry>()
+        val c = KenwoodClient(h, Link.LAN, Pair("kenwood", "admin"), { _, _ -> }, { _, _ -> },
+            onTelemetry = { meters.add(it) })
+        assertTrue(connect(c))
+        repeat(6) {
+            h.on("SM;", "SM0070;")
+            h.on("OM0;", "OM02;")
+            h.on("FA;", "FA00014100000;")
+        }
+        h.on("FL0;", "FL000;"); h.on("RG;", "RG100;"); h.on("SQ;", "SQ000;")
+        h.on("RM;", "RM10024;RM20024;") // selector1 must not satisfy the RM2 waiter
+        h.on("RM;", "RM20070;")
+        h.on("RM;", "?;")
+        h.pushUnsolicited("TX0;")
+        waitUntil { meters.size >= 3 }
+        assertTrue(meters.size >= 3)
+        val first = meters[0]
+        assertTrue(first.hasFwdPower && first.hasRevPower)
+        assertEquals(1.5, first.forwardPower, 1e-12)
+        val expectedSwr = P.swrFromMeter(24, KenwoodModels.ID_TS890S)!!.toDouble()
+        val rho = (expectedSwr - 1.0) / (expectedSwr + 1.0)
+        assertEquals(1.5 * rho * rho, first.reversePower, 1e-12)
+        assertEquals(meters[1].forwardPower, meters[1].reversePower, 0.0)
+        assertTrue(meters[1].hasRevPower)
+        assertTrue(meters[2].hasFwdPower)
+        assertFalse(meters[2].hasRevPower)
+        c.disconnect()
+    }
+
+    @Test
+    fun `serial scope discards a partial sweep when physical geometry changes`() {
+        val h = FakeRig()
+        scriptSerialTs990(h)
+        val (c, cap) = makeClient(h, Link.SERIAL, null)
+        assertTrue(connect(c))
+        val half = (0 until 16).joinToString("") { "DD2%02d%s;".format(it, "10".repeat(20)) }
+        val rest = (16 until 32).joinToString("") { "DD2%02d%s;".format(it, "10".repeat(20)) }
+        h.pushUnsolicited(half + "BS43;" + rest)
+        Thread.sleep(50)
+        assertTrue(synchronized(cap) { cap.spectra.isEmpty() })
+        val sweep = (0 until 32).joinToString("") { "DD2%02d%s;".format(it, "10".repeat(20)) }
+        h.pushUnsolicited("BS21;" + sweep)
+        Thread.sleep(50)
+        assertTrue(synchronized(cap) { cap.spectra.isEmpty() })
+        h.pushUnsolicited("BS20;" + sweep)
+        waitUntil { synchronized(cap) { cap.spectra.size == 1 } }
+        assertEquals(1, synchronized(cap) { cap.spectra.size })
+        assertEquals(30_000, c.sampleRateHz())
+        c.disconnect()
+    }
+
+    @Test
+    fun `DD4 OOR is atomic and incomplete normal sweep is never published`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val scopes = java.util.concurrent.CopyOnWriteArrayList<Triple<Long, Boolean, Int>>()
+        val c = KenwoodClient(h, Link.LAN, Pair("kenwood", "admin"), { _, _ -> }, { _, _ -> },
+            onScopeData = { low, _, oor, bins -> scopes.add(Triple(low, oor, bins.size)) })
+        assertTrue(connect(c))
+        h.pushUnsolicited("DD4000${"%011d".format(100_000)}${"%011d".format(14_100_000)}1;")
+        waitUntil { scopes.isNotEmpty() }
+        assertEquals(listOf(Triple(14_050_000L, true, 0)), scopes.toList())
+        h.pushUnsolicited("DD4000${"%011d".format(100_000)}${"%011d".format(14_100_000)}0;DD401${"10".repeat(20)};")
+        Thread.sleep(50)
+        assertEquals(1, scopes.size)
+        c.disconnect()
+    }
+
+    @Test
+    fun `RX meter sample crossing TX state change is dropped`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val meters = java.util.concurrent.CopyOnWriteArrayList<com.isaklab.isdrproto.RadioTelemetry>()
+        val c = KenwoodClient(h, Link.LAN, Pair("kenwood", "admin"), { _, _ -> }, { _, _ -> },
+            onTelemetry = { meters.add(it) })
+        assertTrue(connect(c))
+        h.on("SM;", "TX0;SM0070;")
+        h.on("OM0;", "OM02;"); h.on("FA;", "FA00014100000;"); h.on("FL0;", "FL000;")
+        waitUntil { h.writesOf("FL0;") == 1 }
+        assertEquals(1, h.writesOf("SM;"))
+        assertTrue(meters.isEmpty())
+        c.disconnect()
+    }
+
+    @Test
+    fun `filter cannot confirm a selection from another physical mode bank`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        h.on("OM0;", "OM02;")
+        h.on("FL0;", "OM03;FL010;")
+        h.on("OM0;", "OM03;")
+        assertFalse(c.setControl(1, 2))
+        assertEquals(3, c.mode())
+        c.disconnect()
+    }
+
+    @Test
+    fun `TS890 control restores Main receive without changing the physical TX VFO`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, cap) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        h.pushUnsolicited("FR1;")
+        h.on("FR;", "FR1;"); h.on("TS;", "TS0;"); h.on("FT;", "FT1;")
+        h.on("FR;", "FR0;"); h.on("FT;", "FT1;")
+        h.on("RG;", "RG042;")
+        assertTrue(c.setControl(2, 42))
+        val w = h.written()
+        assertTrue(w.indexOf("FR0;") < w.indexOf("FT1;"))
+        assertTrue(w.indexOf("FT1;") < w.indexOf("RG042;"))
+        h.pushUnsolicited("FR1;" + String(lanDd2Frame { 0x40 }))
+        Thread.sleep(40)
+        assertTrue(synchronized(cap) { cap.spectra.isEmpty() })
+        c.disconnect()
+    }
+
+    @Test
+    fun `unconfirmed Main receive rollback blocks subsequent keying`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, _) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        h.on("FR;", "FR1;"); h.on("TS;", "TS0;"); h.on("FT;", "FT1;")
+        h.on("FR;", "FR1;"); h.on("FT;", "FT1;") // select Main failed
+        h.on("FR;", "FR0;"); h.on("FT;", "FT1;") // restoring original failed
+        assertFalse(c.setControl(2, 42))
+        assertEquals(0, h.writesOf("RG042;"))
+        assertTrue(c.catControlError()!!.contains("TX blocked"))
+        try { c.setPtt(true); throw AssertionError("uncertain bank allowed TX") }
+        catch (_: IllegalStateException) {}
+        assertEquals(0, h.writesOf("TX0;"))
+        c.disconnect()
+    }
+
+    @Test
+    fun `TS890 fixed scope acquires edges through the documented bare BSM query`() {
+        val h = FakeRig()
+        scriptLanTs890(h)
+        val (c, cap) = makeClient(h, Link.LAN, Pair("kenwood", "admin"))
+        assertTrue(connect(c))
+        assertEquals(1, h.writesOf("BSM;"))
+        assertEquals(0, h.writesOf("BSM0;"))
+        h.pushUnsolicited("BS31;" + String(lanDd2Frame { 0x40 }))
+        waitUntil { synchronized(cap) { cap.spectra.isNotEmpty() } }
+        assertEquals(1, synchronized(cap) { cap.spectra.size })
+        assertEquals(7_000_000L to 7_300_000L, c.scopeEdges())
+        c.disconnect()
+    }
+
 }

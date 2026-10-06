@@ -22,6 +22,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.FilterInputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -30,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -309,10 +311,10 @@ class DriverSessionOpenLifecycleTest {
                     rtlListener.localPort,
                     0,
                 )
-                assertEquals(DriverProto.EV_OPEN_RESULT, checkNotNull(wire.read()).op)
-                assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
                 assertEquals(DriverProto.EV_SAMPLE_RATE, checkNotNull(wire.read()).op)
                 assertEquals(DriverProto.EV_RTL_INFO, checkNotNull(wire.read()).op)
+                assertEquals(DriverProto.EV_OPEN_RESULT, checkNotNull(wire.read()).op)
+                assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
                 assertEquals(
                     normalizedDeviceKey(
                         DriverProto.DEV_RTL_TCP,
@@ -360,7 +362,7 @@ class DriverSessionOpenLifecycleTest {
                 invokeCloseDevice(session)
                 closeDone.countDown()
             }
-            awaitCondition { !gate.isConnecting(epoch) }
+            awaitCondition { !gate.isConnecting(epoch) && radio.disconnectCount.get() >= 1 }
             assertTrue("first cancellation teardown was not requested", radio.disconnectCount.get() >= 1)
             assertFalse("CLOSE returned before connect reached terminal cleanup", closeDone.await(100, TimeUnit.MILLISECONDS))
 
@@ -380,7 +382,7 @@ class DriverSessionOpenLifecycleTest {
     }
 
     @Test
-    fun `RTL open publishes result before status and initial state`() {
+    fun `RTL initial state precedes OPEN before status and media`() {
         val rtlListener = ServerSocket(0)
         val releaseRtl = CountDownLatch(1)
         val rtlDone = CountDownLatch(1)
@@ -405,6 +407,11 @@ class DriverSessionOpenLifecycleTest {
             val wire = wire(sockets.client)
             wire.writeOpen(DriverProto.DEV_RTL_TCP, "127.0.0.1", rtlListener.localPort, 0)
 
+            val sampleRate = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_SAMPLE_RATE, sampleRate.op)
+            assertEquals(2_048_000, sampleRate.payload.int)
+            val rtlInfo = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RTL_INFO, rtlInfo.op)
             val result = checkNotNull(wire.read())
             assertEquals(DriverProto.EV_OPEN_RESULT, result.op)
             assertTrue(result.payload.getBool())
@@ -412,11 +419,6 @@ class DriverSessionOpenLifecycleTest {
             assertEquals(DriverProto.EV_STATUS, status.op)
             assertTrue(status.payload.getBool())
             assertTrue(status.payload.getUtf().startsWith("Connected"))
-            val sampleRate = checkNotNull(wire.read())
-            assertEquals(DriverProto.EV_SAMPLE_RATE, sampleRate.op)
-            assertEquals(2_048_000, sampleRate.payload.int)
-            val rtlInfo = checkNotNull(wire.read())
-            assertEquals(DriverProto.EV_RTL_INFO, rtlInfo.op)
         } finally {
             session.close()
             sockets.client.close()
@@ -455,7 +457,7 @@ class DriverSessionOpenLifecycleTest {
     }
 
     @Test
-    fun `initial state is captured after OPEN publication wins the writer`() {
+    fun `initial state is captured when OPEN wins the writer and precedes its result`() {
         val sockets = sessionSockets()
         val session = authenticatedSession(sockets.server)
         val epoch = (gate(session).begin() as OpenEpochGate.Begin.Started).epoch
@@ -475,8 +477,6 @@ class DriverSessionOpenLifecycleTest {
         try {
             sockets.client.soTimeout = 1_000
             val wire = wire(sockets.client)
-            assertEquals(DriverProto.EV_OPEN_RESULT, checkNotNull(wire.read()).op)
-            assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
             val sampleRate = checkNotNull(wire.read())
             assertEquals(DriverProto.EV_SAMPLE_RATE, sampleRate.op)
             assertEquals(96_000, sampleRate.payload.int)
@@ -487,9 +487,280 @@ class DriverSessionOpenLifecycleTest {
             assertEquals(DriverProto.EV_RX_CONTEXT, rxContext.op)
             assertEquals(RxContext(0, 0, 96_000, listOf(14_200_000L)),
                 RxContext.decode(rxContext.payload))
+            val result = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_OPEN_RESULT, result.op)
+            assertTrue(result.payload.getBool())
+            assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
         } finally {
             session.close()
             sockets.client.close()
+        }
+    }
+
+    @Test
+    fun `rate command sent immediately after OPEN cannot receive the startup rate`() {
+        val sockets = sessionSockets()
+        val session = authenticatedSession(sockets.server)
+        val epoch = (gate(session).begin() as OpenEpochGate.Begin.Started).epoch
+        val radio = object : RadioClient {
+            var rate = 48_000
+            override suspend fun connect() = true
+            override fun disconnect() = Unit
+            override fun setFrequency(hz: Long) = Unit
+            override fun frequencyHz() = 7_100_000L
+            override fun setSampleRate(hz: Int) { rate = hz }
+            override fun sampleRateHz() = rate
+            override var spectrumEnabled = false
+        }
+        assertTrue(session.installCandidate(epoch, radio, "open-rate-barrier") {})
+        enqueueOpenSuccess(session, epoch, radio, "Connected")
+        session.start()
+        try {
+            sockets.client.soTimeout = 1_000
+            val wire = wire(sockets.client)
+            val initialRate = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_SAMPLE_RATE, initialRate.op)
+            assertEquals(48_000, initialRate.payload.int)
+            assertEquals(DriverProto.EV_FREQUENCY, checkNotNull(wire.read()).op)
+            val context = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RX_CONTEXT, context.op)
+            assertEquals(48_000, checkNotNull(RxContext.decode(context.payload)).sampleRateHz)
+            val opened = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_OPEN_RESULT, opened.op)
+            assertTrue(opened.payload.getBool())
+
+            // Match DriverLink.connect(): release the caller at OPEN, without
+            // waiting for an unrelated status message or adding a sleep.
+            wire.writeI32(DriverProto.CMD_SET_SAMPLE_RATE, 384_000)
+            assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
+            val result = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_COMMAND_RESULT, result.op)
+            assertEquals(DriverProto.CMD_SET_SAMPLE_RATE, result.payload.get().toInt() and 255)
+            assertEquals(DriverProto.COMMAND_ACCEPTED, result.payload.get().toInt() and 255)
+            val rate = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_SAMPLE_RATE, rate.op)
+            assertEquals(384_000, rate.payload.int)
+            val changedContext = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RX_CONTEXT, changedContext.op)
+            assertEquals(384_000, checkNotNull(RxContext.decode(changedContext.payload)).sampleRateHz)
+        } finally {
+            session.close()
+            sockets.client.close()
+        }
+    }
+
+    @Test(timeout = 5_000)
+    fun `publication refusal preserves the earlier repeater terminal reservation`() {
+        val sockets = sessionSockets()
+        val session = authenticatedSession(sockets.server)
+        val prefix = kotlinx.coroutines.CompletableDeferred<Unit>()
+        setField(session, "repeaterTerminalTail", prefix)
+        val config = com.isaklab.isdrproto.CatRepeaterConfig(
+            com.isaklab.isdrproto.CatRepeater.DUPLEX_PLUS, 600_000,
+            com.isaklab.isdrproto.CatRepeater.TONE_CTCSS, 885,
+            com.isaklab.isdrproto.CatRepeater.DCS_NORMAL,
+            com.isaklab.isdrproto.CatRepeater.TONE_CTCSS, 885,
+            com.isaklab.isdrproto.CatRepeater.DCS_NORMAL,
+        )
+        val dispatch = DriverSession::class.java.getDeclaredMethod(
+            "handle", com.isaklab.isdrproto.Frame::class.java,
+        ).apply { isAccessible = true }
+        fun request() = com.isaklab.isdrproto.Frame(
+            DriverProto.CMD_CAT_SET_REPEATER, java.nio.ByteBuffer.wrap(config.encode()),
+        )
+        session.start()
+        try {
+            // This CONNECTING-era refusal has no published epoch, but it
+            // already owns a terminal slot behind an older transaction.
+            dispatch.invoke(session, request())
+            val lifecycle = gate(session)
+            val epoch = (lifecycle.begin() as OpenEpochGate.Begin.Started).epoch
+            val publicationClass = DriverSession::class.java.declaredClasses.single {
+                it.simpleName == "OpenPublication"
+            }
+            val publication = publicationClass.getDeclaredConstructor(OpenEpochGate.Epoch::class.java).run {
+                isAccessible = true
+                newInstance(epoch)
+            }
+            publicationClass.getDeclaredField("done").run {
+                isAccessible = true
+                (get(publication) as CountDownLatch).countDown()
+            }
+            setField(session, "openPublication", publication)
+            lifecycle.cancel()
+            dispatch.invoke(session, request())
+            sockets.client.soTimeout = 150
+            val wire = wire(sockets.client)
+            assertThrows(SocketTimeoutException::class.java) { wire.read() }
+            prefix.complete(Unit)
+            sockets.client.soTimeout = 1_000
+            for (detail in listOf("no radio is open", "radio open publication was cancelled")) {
+                val result = checkNotNull(wire.read())
+                assertEquals(DriverProto.EV_COMMAND_RESULT, result.op)
+                assertEquals(DriverProto.CMD_CAT_SET_REPEATER, result.payload.get().toInt() and 255)
+                assertEquals(DriverProto.COMMAND_NO_RADIO, result.payload.get().toInt() and 255)
+                assertEquals(detail, result.payload.getUtf())
+            }
+        } finally {
+            prefix.complete(Unit)
+            session.close()
+            sockets.client.close()
+        }
+    }
+
+    @Test(timeout = 5_000)
+    fun `post OPEN wire command waits for local publication without taking geometry lock`() {
+        exerciseBlockedOpenPublication("success")
+    }
+
+    @Test(timeout = 5_000)
+    fun `terminal false releases post OPEN command without touching hardware`() {
+        exerciseBlockedOpenPublication("false")
+    }
+
+    @Test(timeout = 5_000)
+    fun `shutdown releases post OPEN command without waiting for the writer lock`() {
+        exerciseBlockedOpenPublication("shutdown")
+    }
+
+    private fun exerciseBlockedOpenPublication(outcome: String) {
+        val sockets = sessionSockets()
+        val session = authenticatedSession(sockets.server)
+        val lifecycle = gate(session)
+        val epoch = (lifecycle.begin() as OpenEpochGate.Begin.Started).epoch
+        val writes = AtomicInteger()
+        val radio = object : RadioClient {
+            var rate = 48_000
+            override suspend fun connect() = true
+            override fun disconnect() = Unit
+            override fun setFrequency(hz: Long) = Unit
+            override fun frequencyHz() = 7_100_000L
+            override fun setSampleRate(hz: Int) { writes.incrementAndGet(); rate = hz }
+            override fun sampleRateHz() = rate
+            override var spectrumEnabled = false
+        }
+        assertTrue(session.installCandidate(epoch, radio, "publication-race") {})
+        // Observe the actual reader's progress without substituting dispatch.
+        // The only inbound frame in this authenticated session is nine bytes:
+        // opcode + length + rate. A subsequent socket read means dispatch returned.
+        val reader = AtomicReference<Thread>()
+        val delivered = AtomicInteger()
+        val returnedToSocket = CountDownLatch(1)
+        val observedInput = object : FilterInputStream(sockets.server.getInputStream()) {
+            override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+                reader.set(Thread.currentThread())
+                if (delivered.get() >= 9) returnedToSocket.countDown()
+                return super.read(bytes, offset, length).also { if (it > 0) delivered.addAndGet(it) }
+            }
+        }
+        setField(session, "frames", Frames(
+            DataInputStream(BufferedInputStream(observedInput)),
+            DataOutputStream(BufferedOutputStream(sockets.server.getOutputStream())),
+        ))
+        enqueueOpenSuccess(session, epoch, radio, "Connected")
+        val terminalDone = CountDownLatch(1)
+        var terminalThread: Thread? = null
+        try {
+            sockets.client.soTimeout = 1_000
+            val wire = wire(sockets.client)
+            synchronized(statusDeliveryLock(session)) {
+                session.start()
+                assertEquals(DriverProto.EV_SAMPLE_RATE, checkNotNull(wire.read()).op)
+                assertEquals(DriverProto.EV_FREQUENCY, checkNotNull(wire.read()).op)
+                assertEquals(DriverProto.EV_RX_CONTEXT, checkNotNull(wire.read()).op)
+                val opened = checkNotNull(wire.read())
+                assertEquals(DriverProto.EV_OPEN_RESULT, opened.op)
+                assertTrue(opened.payload.getBool())
+                awaitCondition { epoch.phase == OpenEpochGate.Phase.PUBLISHED }
+                assertFalse(booleanField(session, "radioControlReady"))
+                wire.writeI32(DriverProto.CMD_SET_SAMPLE_RATE, 384_000)
+                awaitCondition {
+                    returnedToSocket.count == 0L || reader.get()?.stackTrace?.any {
+                        it.className == CountDownLatch::class.java.name && it.methodName == "await"
+                    } == true
+                }
+                assertEquals("reader refused instead of awaiting local publication", 1L, returnedToSocket.count)
+                val geometryLock = DriverSession::class.java.getDeclaredField("rxContextLock").run {
+                    isAccessible = true
+                    get(session) as java.util.concurrent.locks.ReentrantLock
+                }
+                assertFalse("publication wait holds the geometry lock", geometryLock.isLocked)
+                assertEquals(0, writes.get())
+                when (outcome) {
+                    "false" -> {
+                        val terminal = checkNotNull(lifecycle.status(epoch, false, "RF link lost"))
+                        terminalThread = thread(name = "false-during-open-publication") {
+                            invokeDeliverStatus(session, epoch, false, "RF link lost", terminal)
+                            terminalDone.countDown()
+                        }
+                        // False wakes the command before its callback can take
+                        // the lock we still hold. It must fail closed immediately.
+                        assertTrue(returnedToSocket.await(1, TimeUnit.SECONDS))
+                        assertEquals(0, writes.get())
+                    }
+                    "shutdown" -> {
+                        terminalThread = thread(name = "shutdown-during-open-publication") {
+                            session.close()
+                            terminalDone.countDown()
+                        }
+                        awaitCondition { reader.get()?.isAlive == false }
+                        assertEquals(0, writes.get())
+                    }
+                }
+            }
+            when (outcome) {
+                "success" -> {
+                    val status = checkNotNull(wire.read())
+                    assertEquals(DriverProto.EV_STATUS, status.op)
+                    assertTrue(status.payload.getBool())
+                    val result = checkNotNull(wire.read())
+                    assertEquals(DriverProto.EV_COMMAND_RESULT, result.op)
+                    assertEquals(DriverProto.CMD_SET_SAMPLE_RATE, result.payload.get().toInt() and 255)
+                    assertEquals(DriverProto.COMMAND_ACCEPTED, result.payload.get().toInt() and 255)
+                    val rate = checkNotNull(wire.read())
+                    assertEquals(DriverProto.EV_SAMPLE_RATE, rate.op)
+                    assertEquals(384_000, rate.payload.int)
+                    assertEquals(DriverProto.EV_RX_CONTEXT, checkNotNull(wire.read()).op)
+                    assertEquals(1, writes.get())
+                }
+                "false" -> {
+                    assertTrue(terminalDone.await(1, TimeUnit.SECONDS))
+                    var statusSeen = false
+                    var resultSeen = false
+                    repeat(2) {
+                        // Frames reuses its payload buffer: consume each answer
+                        // before reading the next, whichever FIFO order wins.
+                        val reply = checkNotNull(wire.read())
+                        when (reply.op) {
+                            DriverProto.EV_STATUS -> {
+                                assertFalse(statusSeen)
+                                statusSeen = true
+                                assertFalse(reply.payload.getBool())
+                                assertEquals("RF link lost", reply.payload.getUtf())
+                            }
+                            DriverProto.EV_COMMAND_RESULT -> {
+                                assertFalse(resultSeen)
+                                resultSeen = true
+                                assertEquals(DriverProto.CMD_SET_SAMPLE_RATE, reply.payload.get().toInt() and 255)
+                                assertEquals(DriverProto.COMMAND_NO_RADIO, reply.payload.get().toInt() and 255)
+                            }
+                            else -> throw AssertionError("unexpected event ${reply.op}")
+                        }
+                    }
+                    assertTrue(statusSeen && resultSeen)
+                    assertFalse(booleanField(session, "radioControlReady"))
+                    assertEquals(0, writes.get())
+                }
+                "shutdown" -> {
+                    assertTrue(terminalDone.await(1, TimeUnit.SECONDS))
+                    assertNull(wire.read())
+                    assertEquals(0, writes.get())
+                }
+            }
+        } finally {
+            session.close()
+            sockets.client.close()
+            terminalThread?.join(1_000)
         }
     }
 
@@ -509,7 +780,7 @@ class DriverSessionOpenLifecycleTest {
 
         try {
             // Hold the local-delivery lock after finishCommit() publishes but
-            // before the writer can set ready=true/capture state.
+            // before the writer can set ready=true. The snapshot is already on wire.
             synchronized(statusDeliveryLock(session)) {
                 session.start()
                 awaitCondition { epoch.phase == OpenEpochGate.Phase.PUBLISHED }
@@ -523,6 +794,9 @@ class DriverSessionOpenLifecycleTest {
             assertTrue(falseDelivered.await(1, TimeUnit.SECONDS))
             sockets.client.soTimeout = 1_000
             val wire = wire(sockets.client)
+            assertEquals(DriverProto.EV_SAMPLE_RATE, checkNotNull(wire.read()).op)
+            assertEquals(DriverProto.EV_FREQUENCY, checkNotNull(wire.read()).op)
+            assertEquals(DriverProto.EV_RX_CONTEXT, checkNotNull(wire.read()).op)
             val result = checkNotNull(wire.read())
             assertEquals(DriverProto.EV_OPEN_RESULT, result.op)
             assertTrue(result.payload.getBool())
@@ -950,7 +1224,8 @@ class DriverSessionOpenLifecycleTest {
         try {
             sockets.client.soTimeout = 1_000
             val wire = wire(sockets.client)
-            while (checkNotNull(wire.read()).op != DriverProto.EV_RX_CONTEXT) Unit
+            while (checkNotNull(wire.read()).op != DriverProto.EV_OPEN_RESULT) Unit
+            assertEquals(DriverProto.EV_STATUS, checkNotNull(wire.read()).op)
             wire.writeI64(DriverProto.CMD_SET_FREQUENCY, 28_400_000L)
             val result = checkNotNull(wire.read())
             assertEquals(DriverProto.EV_COMMAND_RESULT, result.op)
@@ -1057,6 +1332,82 @@ class DriverSessionOpenLifecycleTest {
             session.close()
             sockets.client.close()
         }
+    }
+
+    @Test
+    fun `atomic scope keeps every physical sweep and rejects retired callbacks`() {
+        val sockets = sessionSockets()
+        val session = authenticatedSession(sockets.server)
+        val lifecycle = gate(session)
+        val epoch = publish(lifecycle, "scope")
+        @Suppress("UNCHECKED_CAST")
+        val callback = DriverSession::class.java.getDeclaredMethod("scopeFor", OpenEpochGate.Epoch::class.java).run {
+            isAccessible = true
+            invoke(session, epoch) as (Long, Long, Boolean, FloatArray) -> Unit
+        }
+        session.start()
+        try {
+            val bins = floatArrayOf(-80f, 0f)
+            callback(-25000, 75000, false, bins)
+            callback(-25000, 75000, false, bins)
+            callback(-25000, 75000, true, FloatArray(0))
+            val reader = wire(sockets.client)
+            val seen = (0..2).map {
+                val frame = reader.read()!!
+                assertEquals(DriverProto.EV_SCOPE_DATA, frame.op)
+                checkNotNull(com.isaklab.isdrproto.ScopeData.decode(frame.payload))
+            }
+            assertEquals(listOf(0L, 1L, 2L), seen.map { it.sequence })
+            assertEquals(-25000L, seen[0].lowHz)
+            assertTrue(seen[2].outOfRange)
+            val replacement = (lifecycle.begin() as OpenEpochGate.Begin.Started).epoch
+            assertTrue(lifecycle.handover(replacement).accepted)
+            callback(-25000, 75000, false, bins)
+            sockets.client.soTimeout = 150
+            assertThrows(SocketTimeoutException::class.java) { reader.read() }
+        } finally { session.close(); sockets.client.close() }
+    }
+
+    @Test
+    fun `mode local CAT controls carry confirmed DATA mode before the observation`() {
+        val sockets = sessionSockets()
+        sockets.client.soTimeout = 1_000
+        val session = authenticatedSession(sockets.server)
+        val lifecycle = gate(session)
+        val epoch = publish(lifecycle, "CAT")
+        val expectedMode = 1 or DriverProto.CAT_MODE_DATA_FLAG
+        val radio = object : RadioClient by FakeRadio(), com.isaklab.isdrdrivers.core.CatControlCapable {
+            override fun setCatMode(mode: Int) = false
+            override fun currentCatMode() = expectedMode
+            override fun setCatControl(id: Int, value: Int) = false
+        }
+        setField(session, "radio", radio)
+        @Suppress("UNCHECKED_CAST")
+        val callback = DriverSession::class.java.getDeclaredMethod("catControlFor", OpenEpochGate.Epoch::class.java).run {
+            isAccessible = true
+            invoke(session, epoch) as (Int, Int) -> Unit
+        }
+        session.start()
+        try {
+            val reader = wire(sockets.client)
+            for (id in listOf(1, 10, 11, 12)) {
+                callback(id, 3)
+                val mode = reader.read()!!
+                assertEquals(DriverProto.EV_CAT_MODE, mode.op)
+                assertEquals(expectedMode, mode.payload.int)
+                val control = reader.read()!!
+                assertEquals(DriverProto.EV_CAT_CONTROL, control.op)
+                assertEquals(id, control.payload.int)
+                assertEquals(3, control.payload.int)
+            }
+            callback(2, 200)
+            assertEquals(DriverProto.EV_CAT_CONTROL, reader.read()!!.op)
+            val replacement = (lifecycle.begin() as OpenEpochGate.Begin.Started).epoch
+            assertTrue(lifecycle.handover(replacement).accepted)
+            callback(1, 3)
+            sockets.client.soTimeout = 150
+            assertThrows(SocketTimeoutException::class.java) { reader.read() }
+        } finally { session.close(); sockets.client.close() }
     }
 
     private data class SessionSockets(val client: Socket, val server: Socket)
