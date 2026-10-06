@@ -66,6 +66,7 @@ import java.net.Socket
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -632,7 +633,11 @@ class DriverSession(
     // Data callbacks of one client share a thread, so a plain int suffices.
     private var flushSeq = 0
 
-
+    // A hardware transition may synchronously tear down a receive worker.
+    // Media never waits on that transition (which could join the worker):
+    // tryLock drops and counts the affected flushes, preserving seq gaps.
+    private val rxContextLock = java.util.concurrent.locks.ReentrantLock()
+    private val pendingRxState = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // ---- transmit watchdog -------------------------------------------------
     //
@@ -868,11 +873,25 @@ class DriverSession(
         }
     }
 
+    private fun deliverRxData(epoch: OpenEpochGate.Epoch, main: Boolean, block: () -> Unit) {
+        deliverPublished(epoch) {
+            if (rxContextLock.tryLock()) {
+                try {
+                    announcePendingRxState(epoch)
+                    block()
+                } finally { rxContextLock.unlock() }
+            } else {
+                if (main) flushSeq = (flushSeq + 1) and 0x7fffffff
+                synchronized(outLock) { outDrops++ }
+            }
+        }
+    }
+
     private fun dataFor(epoch: OpenEpochGate.Epoch): (FloatArray, FloatArray) -> Unit =
-        { fft, iq -> deliverPublished(epoch) { onData(epoch, fft, iq) } }
+        { fft, iq -> deliverRxData(epoch, true) { onData(epoch, fft, iq) } }
 
     private fun dataRxFor(epoch: OpenEpochGate.Epoch): (Int, FloatArray) -> Unit =
-        { rx, iq -> deliverPublished(epoch) { onDataRx(epoch, rx, iq) } }
+        { rx, iq -> deliverRxData(epoch, false) { onDataRx(epoch, rx, iq) } }
 
     private fun sweepFor(epoch: OpenEpochGate.Epoch): (Long, FloatArray) -> Unit =
         { lowerEdgeHz, iq ->
@@ -1451,6 +1470,21 @@ class DriverSession(
     // ---- inbound dispatch ----
 
     private fun handle(frame: Frame) {
+        if (changesRxContext(frame.op)) rxContextLock.withLock { handleCommand(frame) }
+        else handleCommand(frame)
+    }
+
+    private fun changesRxContext(op: Int): Boolean = when (op) {
+        DriverProto.CMD_SET_FREQUENCY, DriverProto.CMD_SET_SAMPLE_RATE,
+        DriverProto.CMD_SET_FREQUENCY2, DriverProto.CMD_SET_RX_FREQUENCY,
+        DriverProto.CMD_SET_ACTIVE_RECEIVER, DriverProto.CMD_SET_RECEIVER_COUNT,
+        DriverProto.CMD_SET_RX_STREAM_MASK, DriverProto.CMD_SET_DIVERSITY,
+        DriverProto.CMD_SET_PTT, DriverProto.CMD_SET_TX_FREQUENCY,
+        DriverProto.CMD_HL2_SET_PURESIGNAL -> true
+        else -> false
+    }
+
+    private fun handleCommand(frame: Frame) {
         val p = frame.payload
         // Before authentication only HELLO and AUTH are legal on a LAN
         // session; anything else is a probe — answer nothing and drop it.
@@ -2049,6 +2083,7 @@ class DriverSession(
             }
             throw e
         }
+        if (changesRxContext(frame.op)) announceRxContext()
         if (terminal) {
             sendCommandResult(frame.op, DriverProto.COMMAND_ACCEPTED)
         }
@@ -2357,8 +2392,14 @@ class DriverSession(
             }
             client.setStateListener {
                 deliverPublished(epoch) {
-                    announceSampleRate(client, epoch)
-                    announceFrequency(client, epoch)
+                    pendingRxState.set(true)
+                    // A synchronous control may be waiting for this worker.
+                    // Defer its readback to the next media boundary instead of
+                    // blocking it behind the control thread's transition gate.
+                    if (rxContextLock.tryLock()) {
+                        try { announcePendingRxState(epoch) }
+                        finally { rxContextLock.unlock() }
+                    }
                 }
             }
             accepted = openEpochs.isConnecting(epoch)
@@ -2536,6 +2577,7 @@ class DriverSession(
         val sampleRate: Int,
         val frequency: Long,
         val rtlInfo: ByteBuffer?,
+        val rxContext: com.isaklab.isdrproto.RxContext?,
     )
 
     private fun captureInitialState(opened: RadioClient): InitialOpenState = InitialOpenState(
@@ -2546,6 +2588,7 @@ class DriverSession(
         } else {
             null
         },
+        opened.rxContext(),
     )
 
     private fun writeInitialState(initial: InitialOpenState) {
@@ -2556,6 +2599,34 @@ class DriverSession(
             frames.writeI64(DriverProto.EV_FREQUENCY, initial.frequency)
         }
         initial.rtlInfo?.let { frames.write(DriverProto.EV_RTL_INFO, it) }
+        initial.rxContext?.let { frames.write(DriverProto.EV_RX_CONTEXT, encodeRxContext(it)) }
+    }
+
+    private fun encodeRxContext(context: com.isaklab.isdrproto.RxContext): ByteBuffer =
+        ByteBuffer.allocate(16 + context.frequenciesHz.size * 8).apply {
+            putInt(context.active).putInt(context.streamMask)
+            putInt(context.sampleRateHz).putInt(context.frequenciesHz.size)
+            context.frequenciesHz.forEach { putLong(it) }
+            flip()
+        }
+
+    private fun announceRxContext(
+        current: RadioClient? = radio,
+        epoch: OpenEpochGate.Epoch? = openEpochs.publishedEpoch(),
+    ) {
+        val context = current?.rxContext() ?: return
+        val payload = encodeRxContext(context)
+        if (com.isaklab.isdrproto.RxContext.decode(payload.duplicate()) == null) return
+        enqueueReadback(epoch) { frames.write(DriverProto.EV_RX_CONTEXT, payload) }
+    }
+
+    /** Called only while holding the media/context gate. */
+    private fun announcePendingRxState(epoch: OpenEpochGate.Epoch) {
+        if (!pendingRxState.getAndSet(false)) return
+        val current = radio ?: return
+        announceSampleRate(current, epoch)
+        announceFrequency(current, epoch)
+        announceRxContext(current, epoch)
     }
 
     /** Exact tuner/gain metadata; an unknown table is encoded as known=0,n=0. */

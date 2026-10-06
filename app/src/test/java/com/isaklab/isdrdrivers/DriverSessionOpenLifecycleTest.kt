@@ -15,6 +15,7 @@ import com.isaklab.isdrdrivers.core.RadioClient
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrproto.DriverProto
 import com.isaklab.isdrproto.Frames
+import com.isaklab.isdrproto.RxContext
 import com.isaklab.isdrproto.getBool
 import com.isaklab.isdrproto.getUtf
 import java.io.BufferedInputStream
@@ -482,6 +483,10 @@ class DriverSessionOpenLifecycleTest {
             val frequency = checkNotNull(wire.read())
             assertEquals(DriverProto.EV_FREQUENCY, frequency.op)
             assertEquals(14_200_000L, frequency.payload.long)
+            val rxContext = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RX_CONTEXT, rxContext.op)
+            assertEquals(RxContext(0, 0, 96_000, listOf(14_200_000L)),
+                RxContext.decode(rxContext.payload))
         } finally {
             session.close()
             sockets.client.close()
@@ -901,6 +906,78 @@ class DriverSessionOpenLifecycleTest {
                 get(session) as Collection<*>
             }
             assertTrue("stale IQ buffer was not recycled", pool.isNotEmpty())
+        } finally {
+            session.close()
+            sockets.client.close()
+        }
+    }
+
+    @Test
+    fun `complete receiver context precedes media after a setter joins the receive worker`() {
+        val sockets = sessionSockets()
+        val session = authenticatedSession(sockets.server)
+        val epoch = (gate(session).begin() as OpenEpochGate.Begin.Started).epoch
+        val data = callback2<FloatArray, FloatArray>(session, "dataFor", epoch)
+        val aux = callback2<Int, FloatArray>(session, "dataRxFor", epoch)
+        val workerFinished = AtomicBoolean(false)
+        val initial = RxContext(2, 0b010, 192_000, listOf(7_100_000L, 14_200_000L, 21_300_000L))
+        val radio = object : RadioClient {
+            var current = initial
+            var listener: (() -> Unit)? = null
+            override suspend fun connect() = true
+            override fun disconnect() = Unit
+            override fun setFrequency(hz: Long) {
+                current = current.copy(frequenciesHz = current.frequenciesHz.toMutableList().also { it[0] = hz })
+                val worker = thread(name = "rx-during-control") {
+                    listener?.invoke()
+                    aux(1, floatArrayOf(0.25f, -0.25f))
+                    data(floatArrayOf(), floatArrayOf(0.5f, -0.5f))
+                    workerFinished.set(true)
+                }
+                worker.join(1_000)
+                check(workerFinished.get()) { "control waited on a blocked receive callback" }
+            }
+            override fun frequencyHz() = current.frequenciesHz[0]
+            override fun setSampleRate(hz: Int) = Unit
+            override fun sampleRateHz() = current.sampleRateHz
+            override fun rxContext() = current
+            override fun setStateListener(listener: (() -> Unit)?) { this.listener = listener }
+            override var spectrumEnabled = false
+        }
+        assertTrue(session.installCandidate(epoch, radio, "test") {})
+        enqueueOpenSuccess(session, epoch, radio, "Connected")
+        session.start()
+        try {
+            sockets.client.soTimeout = 1_000
+            val wire = wire(sockets.client)
+            while (checkNotNull(wire.read()).op != DriverProto.EV_RX_CONTEXT) Unit
+            wire.writeI64(DriverProto.CMD_SET_FREQUENCY, 28_400_000L)
+            val result = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_COMMAND_RESULT, result.op)
+            assertEquals(DriverProto.CMD_SET_FREQUENCY, result.payload.get().toInt() and 255)
+            assertEquals(DriverProto.COMMAND_ACCEPTED, result.payload.get().toInt() and 255)
+            val frequency = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_FREQUENCY, frequency.op)
+            assertEquals(28_400_000L, frequency.payload.long)
+            val context = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RX_CONTEXT, context.op)
+            assertEquals(radio.current, RxContext.decode(context.payload))
+
+            // The deferred worker readback must also precede the next flush,
+            // and both surviving branches retain the transition's seq gap.
+            aux(1, floatArrayOf(0.25f, -0.25f))
+            data(floatArrayOf(), floatArrayOf(0.5f, -0.5f))
+            assertEquals(DriverProto.EV_SAMPLE_RATE, checkNotNull(wire.read()).op)
+            assertEquals(DriverProto.EV_FREQUENCY, checkNotNull(wire.read()).op)
+            val pending = checkNotNull(wire.read())
+            assertEquals(DriverProto.EV_RX_CONTEXT, pending.op)
+            assertEquals(radio.current, RxContext.decode(pending.payload))
+            for (op in listOf(DriverProto.EV_DATA_RX, DriverProto.EV_DATA)) {
+                val media = checkNotNull(wire.read())
+                assertEquals(op, media.op)
+                assertEquals(1, media.payload.getInt(media.payload.limit() - 4))
+            }
+            assertTrue(workerFinished.get())
         } finally {
             session.close()
             sockets.client.close()

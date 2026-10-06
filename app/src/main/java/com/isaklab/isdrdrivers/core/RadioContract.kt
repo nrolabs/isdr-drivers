@@ -63,6 +63,14 @@ interface RadioClient {
      */
     fun frequencyHz(): Long = 0
 
+    /** Active IQ stream context; independent of the legacy RX0 readback. */
+    fun rxContext(): com.isaklab.isdrproto.RxContext? {
+        val hz = frequencyHz()
+        val rate = sampleRateHz()
+        if (hz <= 0 || rate <= 0) return null
+        return com.isaklab.isdrproto.RxContext(0, 0, rate, listOf(hz))
+    }
+
     /**
      * The rate the hardware is actually running, in Hz — not necessarily the
      * one that was asked for. The host announces it as EV_SAMPLE_RATE at
